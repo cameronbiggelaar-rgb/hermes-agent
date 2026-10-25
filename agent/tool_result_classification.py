@@ -42,6 +42,33 @@ def is_guardrail_refusal(result: Any) -> bool:
     return isinstance(data, dict) and data.get(GUARDRAIL_REFUSAL_KEY) is True
 
 
+# A harness "nothing changed" payload (soft dedup stub OR hard refusal) is the harness
+# deciding a redundant call itself, NOT the task failing to make progress.
+def is_harness_redundancy_stub(result: Any) -> bool:
+    """Return True when ``result`` is a harness-generated "nothing changed" payload.
+
+    Two such payloads exist, both emitted by the file/skill tools on a repeated
+    identical read, and only ONE carries the ``guardrail_refusal`` marker:
+
+      * hard refusal (``guardrail_refusal``) — "BLOCKED: you called read_file N times"
+      * soft "unchanged" stub (``dedup``) — ``{"status": "unchanged", "dedup": true}``
+
+    Both are the harness deciding a redundant call itself, NOT the task failing to
+    make progress. The no-progress guardrail (``idempotent_no_progress``) must skip
+    both, or the byte-identical stubs feed the counter and a repeated identical read
+    escalates to ``idempotent_no_progress_block`` over calls that never failed.
+    """
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result.strip())
+        except Exception:
+            return False
+    if not isinstance(data, dict):
+        return False
+    return data.get(GUARDRAIL_REFUSAL_KEY) is True or data.get("dedup") is True
+
+
 # A quoted "error"/"failed" in a result's head marks it failed UNLESS it is a key whose value is
 # empty: success payloads routinely carry ``"error": null`` per item (web_extract) or a
 # ``"failed": 0`` count, and a bare substring test flagged every one of them.

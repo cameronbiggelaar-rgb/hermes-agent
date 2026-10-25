@@ -15,7 +15,8 @@ from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import (
-    shape_failure_error, file_mutation_result_landed, has_failure_marker, is_guardrail_refusal, is_rate_limited)
+    shape_failure_error, file_mutation_result_landed, has_failure_marker, is_guardrail_refusal,
+    is_harness_redundancy_stub, is_rate_limited)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
@@ -433,6 +434,16 @@ class ToolCallGuardrailController:
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
         if not self._is_idempotent(tool_name):
+            self._no_progress.pop(signature, None)
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        # A harness "nothing changed" payload (soft dedup stub OR hard refusal) is the
+        # harness choosing a redundant call, not the task failing to progress. Skip it,
+        # or the byte-identical stubs feed the no-progress counter and a repeated
+        # identical read escalates to idempotent_no_progress_block over calls that
+        # never failed. A genuine frozen-content loop (real, unchanging CONTENT) still
+        # counts and still halts at the threshold.
+        if is_harness_redundancy_stub(result):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
