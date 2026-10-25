@@ -844,6 +844,13 @@ def _is_summary_stub(content: str) -> bool:
 # user answer is never re-summarized away on a later prune pass.
 _PRUNE_MIN_CHARS = 200
 
+# A demoted ``read_file`` used to collapse to a one-line announcement, so the model lost the
+# content it had just paid for and re-read the same path (identical args -> identical body ->
+# no-progress halt). The newest few read_file bodies keep their content through compaction;
+# older ones keep the cheap announcement. The cost is bounded by _READ_FILE_KEEP_COUNT rows.
+_READ_FILE_KEEP_COUNT = 3
+_READ_FILE_KEEP_MAX_CHARS = 8000
+
 # Ghost-skill defense: the ONE canonical prune marker; emit sites and presence
 # checks must use the same string so they cannot drift.
 # Ghost-skill defense (#32106): when compaction reduces an old ``skill_view`` result to a 1-line metadata
@@ -1656,6 +1663,45 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         logger.debug("Tool-result summary failed for %s: %s", tool_name, exc)
         _len = len(tool_content) if isinstance(tool_content, str) else 0
         return f"[{tool_name}] ({_len:,} chars result)"
+
+
+def _read_file_keep_indices(
+    result: list[dict[str, Any]], call_id_to_tool: dict[str, tuple[str, str]],
+) -> set[int]:
+    """Row indices of the newest ``_READ_FILE_KEEP_COUNT`` read_file results.
+
+    A read_file body is the content the model is working from; dropping it to a one-line
+    announcement is what made it re-read the same path. Only the newest few are kept, so the
+    extra context cost is bounded.
+    """
+    keep: set[int] = set()
+    for i in range(len(result) - 1, -1, -1):
+        msg = result[i]
+        if msg.get("role") != "tool":
+            continue
+        tool_name, _ = call_id_to_tool.get(msg.get("tool_call_id", ""), ("unknown", ""))
+        if tool_name != "read_file":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        keep.add(i)
+        if len(keep) >= _READ_FILE_KEEP_COUNT:
+            break
+    return keep
+
+
+def _read_file_kept_content(content: str) -> str:
+    """The read_file body that survives compaction: the content itself when it fits, otherwise its
+    head plus a hint that names the recovery (a different window), so the model does not repeat
+    the same call and stall on the no-progress guard."""
+    if len(content) <= _READ_FILE_KEEP_MAX_CHARS:
+        return content
+    head = content[:_READ_FILE_KEEP_MAX_CHARS]
+    return (
+        f"{head}\n[read_file body truncated by compaction: {len(head):,} of {len(content):,} chars kept; "
+        f"re-read with a different offset/limit for the rest]"
+    )
 
 
 def _sum_terminal(name, args, content, content_len, line_count):
@@ -3180,9 +3226,12 @@ class ContextCompressor(
     def _demote_tool_result_at(
         result: list[dict[str, Any]], idx: int, call_id_to_tool: dict[str, tuple[str, str]],
         min_prune_chars: int, protected_skills: Optional[set[str]] = None,
+        keep_reads: Optional[set[int]] = None,
     ) -> bool:
         """Replace the tool result at ``idx`` with a 1-line summary; True if modified.
-        ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard."""
+        ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard.
+        ``keep_reads`` holds the newest read_file rows, whose content survives instead of the
+        announcement (a bare announcement is what sent the model into a re-read loop)."""
         msg = result[idx]
         if msg.get("role") != "tool":
             return False
@@ -3204,6 +3253,12 @@ class ContextCompressor(
             _skill = _json_dict(tool_args).get("name", "")
             if isinstance(_skill, str) and _skill.lower() in protected_skills:
                 return False
+        if keep_reads and idx in keep_reads and tool_name == "read_file" and not _result_failure_suffix(content):
+            kept = _read_file_kept_content(content)
+            if kept != content:
+                result[idx] = {**msg, "content": kept}
+                return True
+            return False
         result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
         return True
 
@@ -3220,6 +3275,7 @@ class ContextCompressor(
     def _pressure_demote_tail(
         self, result: list[dict[str, Any]], prune_boundary: int, protect_tail_tokens: int,
         call_id_to_tool: dict[str, tuple[str, str]], min_prune_chars: int, spared: range,
+        keep_reads: Optional[set[int]] = None,
     ) -> int:
         """Pass 4: demote tool-result bodies inside the protected tail when it alone exceeds the soft
         budget (#61932). Keeps a short recent floor and the ``spared`` pending tool round verbatim; overrides
@@ -3234,11 +3290,13 @@ class ContextCompressor(
 
         demoted = 0
 
-        def _shrink_at(i: int) -> None:
+        def _shrink_at(i: int, force: bool = False) -> None:
             nonlocal demoted
             if i in spared:
                 return
-            if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars):
+            if self._demote_tool_result_at(
+                result, i, call_id_to_tool, min_prune_chars, keep_reads=None if force else keep_reads,
+            ):
                 demoted += 1
 
         if demote_end <= prune_boundary or _protected_region_tokens() <= soft_ceiling:
@@ -3251,7 +3309,7 @@ class ContextCompressor(
         if _protected_region_tokens() > soft_ceiling:
             last_tool_idx = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "tool"), None)
             for i in (i for i in range(start, len(result)) if i != last_tool_idx):
-                _shrink_at(i)
+                _shrink_at(i, force=True)
             # Last resort, unless it is the spared pending round: the newest body may exceed the soft budget
             # alone (one 200KB read); summarize it.
             if (
@@ -3301,11 +3359,14 @@ class ContextCompressor(
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
         protected_skills = _collect_protected_skill_names(result, prune_boundary)
+        # The newest read_file bodies keep their content: a one-line announcement is what sent
+        # the model into a re-read loop (identical args -> identical body -> no-progress halt).
+        keep_reads = _read_file_keep_indices(result, call_id_to_tool)
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().
         pruned += sum(
-            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
+            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills, keep_reads)
             for i in range(max(0, prune_boundary))
         )
         # Pass 3: retire image payloads inside the protected tail; re-sent embeds otherwise make
@@ -3314,7 +3375,7 @@ class ContextCompressor(
         pruned += _retire_stale_tool_result_images(result, spared=spared)
         if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
             pruned += self._pressure_demote_tail(
-                result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared,
+                result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared, keep_reads,
             )
         return result, pruned
 
