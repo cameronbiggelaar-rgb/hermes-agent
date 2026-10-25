@@ -151,3 +151,37 @@ class TestReadFileKeepsItsContent:
         assert "READMARK" in _tool_row(messages, "call_read")["content"], (
             "the pressure pass stripped the kept read_file body"
         )
+
+
+class TestReadFileTwinKeepsItsBody:
+    """The row that survives compaction in ``state.db`` must carry the body.
+
+    ``archive_and_compact()`` does not materialise an announcement: it re-inserts the
+    caller's in-memory dicts as fresh active rows.  The 2026-10-26 incident wrote 89-char
+    announcement twins because the demotion had already replaced the body upstream, so the
+    unit-level seam alone does not prove what the model actually reads back.
+    """
+
+    def test_persisted_twin_row_keeps_the_read_body(self):
+        import tempfile
+        from pathlib import Path
+
+        from hermes_state import SessionDB
+
+        body = "LINE-0\n" + ("x" * 600)
+        messages = _read_messages([("/tmp/probe24.txt", body)])
+
+        pruned, _ = _compressor()._prune_old_tool_results(messages, protect_tail_count=2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            db.ensure_session("s1", source="test")
+            db.append_message("s1", "user", "seed")
+            db.archive_and_compact("s1", pruned)
+
+            rows = db.get_messages("s1")
+
+        kept = [row for row in rows if "LINE-0" in (row.get("content") or "")]
+        assert kept, "the persisted row lost the read_file body"
+        announced = [row for row in rows if (row.get("content") or "").startswith("[read_file] read")]
+        assert not announced, "the persisted row is the bare announcement, not the body"
