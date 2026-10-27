@@ -42,3 +42,43 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # CVE-only coverage for source dependencies (fork-local addition).
+  #
+  # These entries declare the pip and npm ecosystems but deliberately do NOT
+  # enable version updates: open-pull-requests-limit: 0 suppresses scheduled
+  # version-bump PRs for them, so no automated job can move an exact-pinned
+  # dependency. Security-update (CVE) PRs are governed separately by the
+  # repository's Dependabot security updates setting
+  # (Settings -> Code security -> Dependabot -> Dependabot security updates),
+  # which uses its own fixed limit and is not affected by this value.
+  - package-ecosystem: "pip"
+    directories:
+      - "/"
+      - "/pm"
+      - "/optional-skills/finance/dcf-model"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/"
+      - "/website"
+      - "/plugins/platforms/photon/sidecar"
+      - "/scripts/whatsapp-bridge"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore(deps)"
