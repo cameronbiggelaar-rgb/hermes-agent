@@ -410,6 +410,31 @@ AMBIGUOUS_SKILL_PREFIX = "Ambiguous skill name "
 _SHADOW_CHECKED: set[tuple[str, ...]] = set()
 
 
+def _walk_reaches(outer: Path, inner: Path) -> bool:
+    """True when a walk of *outer* actually descends as far as *inner*.
+
+    The scanner prunes ``EXCLUDED_SKILL_DIRS`` anywhere and a skill's support dirs
+    (``references``/``templates``/``assets``/``scripts``) at a level that holds a ``SKILL.md``.
+    A root under either is *not* covered by the outer root even though it is nested inside it —
+    dropping it by realpath ancestry would silently lose those skills from every surface that
+    reads :func:`get_skill_search_roots`. Only the path components are inspected: no traversal,
+    so the check stays O(depth).
+    """
+    try:
+        outer_real = Path(os.path.realpath(outer))
+        rel = Path(os.path.realpath(inner)).relative_to(outer_real)
+    except (OSError, ValueError):
+        return False
+    current = outer_real
+    for part in rel.parts:
+        if part in EXCLUDED_SKILL_DIRS or (
+            part in SKILL_SUPPORT_DIRS and (current / "SKILL.md").is_file()
+        ):
+            return False
+        current = current / part
+    return True
+
+
 def get_skill_search_roots(local: Optional[Path] = None, *, include_project: bool = True) -> list[tuple[int, Path]]:
     """``(tier, dir)`` for every skill root in precedence order — the ONE ordering the skills list,
     prompt index, slash commands, skill_view, preload and cron share. *local* overrides the profile
@@ -420,9 +445,11 @@ def get_skill_search_roots(local: Optional[Path] = None, *, include_project: boo
     if create_dir is not None and create_dir.is_dir():
         roots.append((TIER_CREATE_DIR, create_dir))
     roots += [(TIER_EXTERNAL, d) for d in get_external_skills_dirs()]
-    # Drop duplicates AND roots nested inside an earlier (higher-precedence) root: the same
-    # corpus configured twice — or an external dir under the local skills dir — would otherwise
-    # be walked once per root, and a bundle that links its own tree would be walked forever.
+    # Drop duplicates AND roots nested inside an earlier (higher-precedence) root — but only when
+    # that earlier root's walk actually reaches them (_walk_reaches): a root under a skill's
+    # references/ or under .git/node_modules is pruned by the parent scanner, so it must be kept
+    # and scanned on its own. Without this, the same corpus configured twice would be walked once
+    # per root and a bundle linking its own tree would be walked forever.
     kept: list[tuple[int, Path]] = []
     kept_real: list[Path] = []
     for tier, d in roots:
@@ -430,7 +457,10 @@ def get_skill_search_roots(local: Optional[Path] = None, *, include_project: boo
             real = Path(os.path.realpath(d))
         except OSError:
             real = d
-        if any(real == prev or real.is_relative_to(prev) for prev in kept_real):
+        if any(
+            real == prev or (real.is_relative_to(prev) and _walk_reaches(prev, real))
+            for prev in kept_real
+        ):
             continue
         kept.append((tier, d))
         kept_real.append(real)
