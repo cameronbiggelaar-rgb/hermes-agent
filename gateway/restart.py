@@ -60,8 +60,28 @@ CRON_DRAIN_CLEANUP_RESERVE_S = 10.0
 # systemd TimeoutStopSec headroom after the stop-path drain budget, and the floor when that
 # budget is still the default immediate (0s) chat drain. Keep in lockstep with generate_systemd_unit().
 # See #94759.
-SYSTEMD_STOP_HEADROOM_S = 30.0
+#
+# The headroom is NOT slack for the drain: systemd starts its stop clock at SIGTERM, so whatever the
+# drain spends is gone before interrupt/settle/finalize/quiesce/close even start. A 30s headroom was
+# therefore smaller than ``run_runtime.settle_gateway_runtime``'s own 45s settle budget (plus its 10s
+# tail reserve) — a unit could be "correct" by this function and still be SIGKILLed mid-settle. 120s
+# covers the worst case for every phase after the drain starts: notify 15 + settle 45 + finalize 15
+# + close 10 = 85s, plus margin. The 2026-11-03 stop measured 193.6s total with the drain already
+# timed out (85s of phases still to come in the slow case), and it fits with 35s to spare. It also
+# lands the generated unit on 300s for the shipped 180s drain — the exact ceiling that carried the
+# cutover, so retiring the temporary drop-in changes no runtime behaviour.
+SYSTEMD_STOP_HEADROOM_S = 120.0
 SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
+# Reserve the *live* TimeoutStopSec must still hold once the drain returns: the post-drain phases
+# (interrupt, settle, finalize adapters, quiesce, close SessionDB, persist exit). Applied as a cap on
+# the drain itself so a stale/undersized unit (e.g. the shipped 210s with a 180s drain) can never
+# spend the whole envelope and leave the teardown to be SIGKILLed. Covers settle (45) + its tail
+# reserve (10) + quiesce/SessionDB close (7.1s measured) and still leaves ~35s of margin at the
+# measured 2026-11-03 cost profile.
+SYSTEMD_POST_DRAIN_RESERVE_S = 90.0
+# Margin below TimeoutStopSec at which our own shutdown watchdog must dump stacks and os._exit, so
+# the forensic dump lands before systemd's SIGKILL (mirrors LAUNCHD_WATCHDOG_DUMP_MARGIN_S).
+SYSTEMD_WATCHDOG_DUMP_MARGIN_S = 5.0
 
 # launchd is the one supervisor whose stop budget the gateway cannot size:
 # ``ExitTimeOut`` lives in the plist, and the per-user (gui) domain CLAMPS
@@ -185,20 +205,45 @@ def resolve_launchd_capped_drain(
     return min(drain, max(budget - _seconds(cleanup_reserve_s), 0.0))
 
 
+def resolve_systemd_capped_drain(
+    drain_timeout: object, timeout_stop_s: object,
+    cleanup_reserve_s: float = SYSTEMD_POST_DRAIN_RESERVE_S,
+) -> float:
+    """``drain_timeout`` capped to what the *live* systemd ``TimeoutStopSec`` leaves after
+    ``cleanup_reserve_s`` for the post-drain teardown.
+
+    systemd's stop clock starts at SIGTERM and covers the whole stop: drain + interrupt + settle +
+    finalize + quiesce + close.  A drain sized equal to (or near) the unit timeout therefore leaves
+    the teardown to be SIGKILLed — the exact failure a 300s drop-in was masking.  Fail-open: an
+    unknown, zero, negative or non-finite budget keeps the configured drain unchanged (tests and
+    non-systemd supervisors never lose their budget to a probe failure).
+    """
+    drain = _seconds(drain_timeout)
+    unit = _seconds(timeout_stop_s)
+    reserve = _seconds(cleanup_reserve_s, SYSTEMD_POST_DRAIN_RESERVE_S)
+    if not math.isfinite(unit) or unit <= 0.0:
+        return drain
+    # A unit smaller than the reserve still must not spend its whole envelope on the drain: give the
+    # teardown everything (drain 0 -> interrupt now) rather than guaranteeing the SIGKILL.
+    return max(0.0, min(drain, unit - reserve))
+
+
 def effective_stop_drain_timeout(runner: object) -> float:
     """Drain budget for the stop in progress on ``runner``.
 
     Signal-driven stops under launchd are timed by launchd's live
     ``ExitTimeOut`` (``runner._launchd_exit_timeout_s``, set at boot);
     everything else — in-band SIGUSR1 restart after the turn, ``--replace``
-    takeover, tests — keeps the configured drain. Duck-typed and
+    takeover, tests — keeps the configured drain, except that any stop under
+    systemd is capped by the live ``TimeoutStopSec`` (``runner._systemd_timeout_stop_sec``,
+    set at boot from the same probe that logs the alignment warning). Duck-typed and
     getattr-guarded on purpose: shutdown-path tests drive ``_stop_impl``
     from bare doubles that are not ``GatewayRunner`` instances.
     """
     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
-    if not getattr(runner, "_stop_requested_by_signal", False):
-        return drain
-    return resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
+    if getattr(runner, "_stop_requested_by_signal", False):
+        drain = resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
+    return resolve_systemd_capped_drain(drain, getattr(runner, "_systemd_timeout_stop_sec", None))
 
 
 def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> float:
@@ -213,10 +258,14 @@ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> floa
     duck-typing / fail-open rules as :func:`effective_stop_drain_timeout`.
     """
     leash = _seconds(watchdog_delay)
-    if not getattr(runner, "_stop_requested_by_signal", False):
-        return leash
-    return resolve_launchd_capped_drain(
-        leash, getattr(runner, "_launchd_exit_timeout_s", None), cleanup_reserve_s=LAUNCHD_WATCHDOG_DUMP_MARGIN_S,
+    if getattr(runner, "_stop_requested_by_signal", False):
+        leash = resolve_launchd_capped_drain(
+            leash, getattr(runner, "_launchd_exit_timeout_s", None), cleanup_reserve_s=LAUNCHD_WATCHDOG_DUMP_MARGIN_S,
+        )
+    # Under systemd the leash must fire before TimeoutStopSec or the forensic dump is lost to SIGKILL.
+    return resolve_systemd_capped_drain(
+        leash, getattr(runner, "_systemd_timeout_stop_sec", None),
+        cleanup_reserve_s=SYSTEMD_WATCHDOG_DUMP_MARGIN_S,
     )
 
 

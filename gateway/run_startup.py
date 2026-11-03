@@ -1039,6 +1039,13 @@ class GatewayStartupMixin:
                 self._restart_drain_timeout,
                 getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
             )
+            if _alignment is not None:
+                # Remember the *live* budget so the stop path can size the drain and the watchdog
+                # leash inside it (see gateway.restart.effective_stop_drain_timeout).
+                try:
+                    self._systemd_timeout_stop_sec = float(_alignment["timeout_stop_sec"])
+                except (KeyError, TypeError, ValueError):
+                    self._systemd_timeout_stop_sec = None
             if _alignment is not None and _alignment.get("mismatch"):
                 logger.warning(
                     "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but drain_timeout=%.0fs "

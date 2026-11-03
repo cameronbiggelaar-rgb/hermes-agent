@@ -183,15 +183,16 @@ class TestResolveSystemdTimeoutStopSec:
 
 
     def test_configured_drain_still_extends_the_deadline_directly(self):
-        assert resolve_systemd_timeout_stop_sec(60.0, 30.0) == 90
-        assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == 210
+        assert resolve_systemd_timeout_stop_sec(60.0, 30.0) == 180
+        assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == 300
 
     def test_larger_cron_floor_raises_timeout_stop_sec(self):
-        # 60s cron + 10s reserve + 30s headroom = 100s
-        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 100
+        # 60s cron + 10s reserve + 120s headroom = 190s
+        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 190
 
     def test_zero_cron_floor_is_an_opt_out_not_a_hidden_default(self):
-        assert resolve_systemd_timeout_stop_sec(0.0, 0.0) == 60
+        # Headroom (90s) now exceeds the 60s floor, so the floor only binds with a long drain.
+        assert resolve_systemd_timeout_stop_sec(0.0, 0.0) == 120
 
     def test_cron_floor_never_shortens_a_long_drain(self):
         assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == resolve_systemd_timeout_stop_sec(
@@ -199,4 +200,4 @@ class TestResolveSystemdTimeoutStopSec:
         )
 
     def test_garbage_inputs_degrade_to_the_floor(self):
-        assert resolve_systemd_timeout_stop_sec("soon", None) == 60
+        assert resolve_systemd_timeout_stop_sec("soon", None) == 120

@@ -2177,6 +2177,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             "restart_drain_timeout": self._restart_drain_timeout,
             "effective_drain_timeout": effective_stop_drain_timeout(self),
             "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
+            "systemd_timeout_stop_s": getattr(self, "_systemd_timeout_stop_sec", None),
             "watchdog_delay_s": _effective_watchdog_leash(self),
             "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,
         }
@@ -2204,10 +2205,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
             if timeout < self._restart_drain_timeout:
+                _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
+                _systemd_budget = getattr(self, "_systemd_timeout_stop_sec", None)
+                if _launchd_budget:
+                    _source, _budget = "live launchd exit timeout", _launchd_budget
+                else:
+                    _source, _budget = "live systemd TimeoutStopSec", _systemd_budget or 0.0
                 logger.warning(
-                    "Shutdown drain capped to %.0fs (configured %.0fs) to fit the live launchd exit "
-                    "timeout of %.0fs — launchd SIGKILLs past it",
-                    timeout, self._restart_drain_timeout, self._launchd_exit_timeout_s,
+                    "Shutdown drain capped to %.0fs (configured %.0fs) to fit inside the %s of "
+                    "%.0fs with room for teardown — the service manager SIGKILLs past it",
+                    timeout, self._restart_drain_timeout, _source, _budget,
                 )
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
