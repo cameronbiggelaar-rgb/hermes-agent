@@ -21,8 +21,12 @@ logger = logging.getLogger(__name__)
 
 PLATFORM_MAP = {"macos": "darwin", "linux": "linux", "windows": "win32"}
 
+# Where profile-distribution installs stage and set aside a dir they swap in (same parent, so the
+# rename stays atomic); a backup a lock keeps there must never be discovered as a second copy.
+DIST_SWAP_DIR = ".hermes-dist"
+
 EXCLUDED_SKILL_DIRS = frozenset((
-    ".git", ".github", ".hub", ".archive", ".curator_backups", ".locks",
+    ".git", ".github", ".hub", ".archive", ".curator_backups", ".locks", DIST_SWAP_DIR,
     ".venv", "venv", "node_modules", "site-packages", "__pycache__",
     ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 ))
@@ -208,24 +212,23 @@ def _raw_config_cache_clear() -> None:
         _RAW_CONFIG_CACHE.clear()
 
 
-def _config_cache_key(config_path: Path) -> Optional[tuple[str, int, int, int, int]]:
-    """``(path, *file_signature)`` identity of config.yaml, or None when unreadable/absent."""
-    try:
-        from utils import file_signature
-        return (str(config_path), *file_signature(config_path.stat()))
-    except OSError:
-        return None
+def _config_cache_key(config_path: Path) -> Optional[tuple[Any, ...]]:
+    """``(path, *backend cache version)`` identity of config.yaml, or None when unreadable/absent."""
+    from hermes_cli.config_backend import config_cache_version_or_none
+    version = config_cache_version_or_none(config_path)
+    return None if version is None else (str(config_path), *version)
 
 
 def _load_raw_config() -> dict[str, Any]:
-    """Read config.yaml with an mtime+size keyed cache (no hermes_cli.config import)."""
+    """Read config.yaml with a version-keyed cache (no hermes_cli.config import)."""
     from agent.safe_worker_policy import worker_config_snapshot
+    from hermes_cli.config_backend import config_exists, read_config_doc
 
     snapshot = worker_config_snapshot()
     if snapshot is not None:
         return snapshot
     config_path = get_config_path()
-    if not config_path.exists():
+    if not config_exists(config_path):
         return {}
     cache_key = _config_cache_key(config_path)
     with _RAW_CONFIG_CACHE_LOCK:
@@ -233,7 +236,7 @@ def _load_raw_config() -> dict[str, Any]:
     if cached is not None:
         return cached
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8-sig"))
+        parsed = read_config_doc(config_path)
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
@@ -337,8 +340,9 @@ def _config_str_list(raw) -> list[str]:
 def get_external_skills_dirs() -> list[Path]:
     """Validated, deduplicated ``skills.external_dirs`` (existing dirs only). Entries
     are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
+    from hermes_cli.config_backend import config_exists
     config_path = get_config_path()
-    if not config_path.exists():
+    if not config_exists(config_path):
         return []
     full_key = _config_cache_key(config_path)
     cache_key = full_key
@@ -406,6 +410,31 @@ AMBIGUOUS_SKILL_PREFIX = "Ambiguous skill name "
 _SHADOW_CHECKED: set[tuple[str, ...]] = set()
 
 
+def _walk_reaches(outer: Path, inner: Path) -> bool:
+    """True when a walk of *outer* actually descends as far as *inner*.
+
+    The scanner prunes ``EXCLUDED_SKILL_DIRS`` anywhere and a skill's support dirs
+    (``references``/``templates``/``assets``/``scripts``) at a level that holds a ``SKILL.md``.
+    A root under either is *not* covered by the outer root even though it is nested inside it —
+    dropping it by realpath ancestry would silently lose those skills from every surface that
+    reads :func:`get_skill_search_roots`. Only the path components are inspected: no traversal,
+    so the check stays O(depth).
+    """
+    try:
+        outer_real = Path(os.path.realpath(outer))
+        rel = Path(os.path.realpath(inner)).relative_to(outer_real)
+    except (OSError, ValueError):
+        return False
+    current = outer_real
+    for part in rel.parts:
+        if part in EXCLUDED_SKILL_DIRS or (
+            part in SKILL_SUPPORT_DIRS and (current / "SKILL.md").is_file()
+        ):
+            return False
+        current = current / part
+    return True
+
+
 def get_skill_search_roots(local: Optional[Path] = None, *, include_project: bool = True) -> list[tuple[int, Path]]:
     """``(tier, dir)`` for every skill root in precedence order — the ONE ordering the skills list,
     prompt index, slash commands, skill_view, preload and cron share. *local* overrides the profile
@@ -416,8 +445,26 @@ def get_skill_search_roots(local: Optional[Path] = None, *, include_project: boo
     if create_dir is not None and create_dir.is_dir():
         roots.append((TIER_CREATE_DIR, create_dir))
     roots += [(TIER_EXTERNAL, d) for d in get_external_skills_dirs()]
-    seen: set[Path] = set()
-    return [(t, d) for t, d in roots if not (d in seen or seen.add(d))]
+    # Drop duplicates AND roots nested inside an earlier (higher-precedence) root — but only when
+    # that earlier root's walk actually reaches them (_walk_reaches): a root under a skill's
+    # references/ or under .git/node_modules is pruned by the parent scanner, so it must be kept
+    # and scanned on its own. Without this, the same corpus configured twice would be walked once
+    # per root and a bundle linking its own tree would be walked forever.
+    kept: list[tuple[int, Path]] = []
+    kept_real: list[Path] = []
+    for tier, d in roots:
+        try:
+            real = Path(os.path.realpath(d))
+        except OSError:
+            real = d
+        if any(
+            real == prev or (real.is_relative_to(prev) and _walk_reaches(prev, real))
+            for prev in kept_real
+        ):
+            continue
+        kept.append((tier, d))
+        kept_real.append(real)
+    return kept
 
 
 def get_all_skills_dirs() -> list[Path]:
@@ -654,11 +701,12 @@ def is_quarantined_project_skill(skill_md) -> bool:
     return quarantined
 
 
-def iter_project_skill_files(project_dir: Path):
+def iter_project_skill_files(project_dir: Path, *, seen: Optional[Set[Tuple[int, int]]] = None):
     """Yield non-quarantined SKILL.md files under a trusted project dir — the
     single iteration chokepoint for the project tier, so the quarantine cannot
     be bypassed by a call site forgetting the check."""
-    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md") if not is_quarantined_project_skill(p))
+    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md", seen=seen)
+                if not is_quarantined_project_skill(p))
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:
@@ -871,15 +919,87 @@ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bo
     return len(_normalize_skill_description(frontmatter)) > SKILL_PROMPT_DESC_LIMIT
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
-    """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
-    matches: list[str] = []
+# A skills root is scanned on every turn (prompt index) and every command-menu rebuild
+# (gateway platforms), so the walk must stay linear in *real* directories. A symlinked bundle
+# that points back into the tree — a self-link, a link to an ancestor, the same bundle linked
+# from two places, two overlapping roots — otherwise expands until the path-length cap, which
+# is what turned skill discovery into an unbounded scan. The cap below is a backstop only.
+SKILL_WALK_DIR_LIMIT = 50_000
+
+
+def _dir_identity(path: str) -> Optional[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` for *path* following symlinks, or None when it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def walk_skill_dirs(
+    skills_dir,
+    *,
+    seen: Optional[Set[Tuple[int, int]]] = None,
+    max_dirs: int = SKILL_WALK_DIR_LIMIT,
+):
+    """``os.walk(..., followlinks=True)`` that descends each real directory at most once.
+
+    Yields ``(root, dirs, files)`` for every directory under *skills_dir*, pruning
+    EXCLUDED_SKILL_DIRS and support dirs of a skill (the same rules as
+    :func:`iter_skill_index_files`), but keyed on directory identity: a directory reachable
+    twice — symlink loop, link to an ancestor, a bundle linked from two paths, or a second root
+    sharing *seen* — is descended once. Legitimate symlinked skills still yield the path they
+    were first reached by, and a root already covered by an earlier walk in the same *seen*
+    yields nothing.
+
+    A directory's identity is claimed when its PARENT is scanned, before any descent, so the
+    shallowest path to a directory wins: a skill reached both as ``skills/<cat>/<name>`` and as
+    ``skills/<cat>/<bundle>/.tmp/.../research/<name>`` is reported under the first, and the
+    canonical path is not lost to a bundle that happens to sort earlier.
+
+    *max_dirs* caps the number of directories yielded so a pathological tree degrades to a
+    bounded scan instead of unbounded memory.
+    """
+    visited = seen if seen is not None else set()
+    root_identity = _dir_identity(str(skills_dir))
+    if root_identity is not None:
+        if root_identity in visited:
+            return
+        visited.add(root_identity)
+    walked = 0
     for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
         has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
-        if filename in files:
-            matches.append(os.path.join(root, filename))
+        kept: list[str] = []
+        for name in sorted(dirs):
+            if name in EXCLUDED_SKILL_DIRS or (has_skill_md and name in SKILL_SUPPORT_DIRS):
+                continue
+            identity = _dir_identity(os.path.join(root, name))
+            # Unstatable (broken link) or already-walked directory: never descend again.
+            if identity is None or identity in visited:
+                continue
+            visited.add(identity)
+            kept.append(name)
+        dirs[:] = kept
+        walked += 1
+        if walked > max_dirs:
+            logger.warning(
+                "Skill walk of %s stopped after %d directories (SKILL_WALK_DIR_LIMIT); "
+                "check for symlinked bundles that re-enter the tree.", skills_dir, max_dirs)
+            return
+        yield root, dirs, files
+
+
+def iter_skill_index_files(skills_dir: Path, filename: str, *, seen: Optional[Set[Tuple[int, int]]] = None):
+    """Walk skills_dir yielding sorted paths matching *filename*; prunes
+    EXCLUDED_SKILL_DIRS and support dirs of skill roots.
+
+    Cycle-safe: see :func:`walk_skill_dirs`. Pass a shared *seen* set to scan several
+    overlapping roots without visiting the same directory twice."""
+    matches: list[str] = [
+        os.path.join(root, filename)
+        for root, _dirs, files in walk_skill_dirs(str(skills_dir), seen=seen)
+        if filename in files
+    ]
     yield from map(Path, sorted(matches))
 
 

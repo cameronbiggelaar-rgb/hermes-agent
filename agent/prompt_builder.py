@@ -24,12 +24,12 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS,
     TIER_LOCAL, clip_skill_description, extract_skill_conditions, extract_skill_description,
-    get_disabled_skill_names, get_skill_search_roots,
+    get_disabled_skill_names, get_skill_search_roots, walk_skill_dirs,
     iter_skill_index_files, parse_frontmatter, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
-from utils import atomic_json_write, file_signature
+from utils import atomic_json_write, file_cache_version
 
 logger = logging.getLogger(__name__)
 
@@ -1102,15 +1102,15 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     manifest: dict[str, list[int]] = {}
     skills_dir_str = str(skills_dir)
     prefix_len = len(os.path.join(skills_dir_str, ""))
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+    # walk_skill_dirs: same pruning as the scan, but each real dir at most once (symlinked
+    # bundles that re-enter the tree cannot inflate the manifest walk).
+    for root, _dirs, files in walk_skill_dirs(skills_dir_str):
         for filename in ("SKILL.md", "DESCRIPTION.md"):
             path = os.path.join(root, filename)
             try:
                 if filename in files:
                     st = os.stat(path)
-                    manifest[path[prefix_len:]] = list(file_signature(st))
+                    manifest[path[prefix_len:]] = list(file_cache_version(path, st, always_digest=True))
             except OSError:
                 pass
     return manifest
@@ -1403,6 +1403,9 @@ def _build_skills_system_prompt_inner(
                 or not _skill_should_show(conditions, available_tools, available_toolsets, _platform_hint or None))
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    # One identity set for every tier: a root nested inside an already-scanned root (a bundle
+    # pointing back into the corpus, an external dir under the local one) is walked once.
+    seen_dirs: set[tuple[int, int]] = set()
     # Disk snapshot (fast path) vs. full scan: both yield (entry, is_compatible) pairs so labeling runs identically.
     if snapshot is not None:
         # Platforms and app presence are host facts that change without SKILL.md changing: re-evaluate both.
@@ -1411,7 +1414,7 @@ def _build_skills_system_prompt_inner(
                       for entry in snapshot.get("skills", []) if isinstance(entry, dict)]
     else:
         candidates = []
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md", seen=seen_dirs):
             is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             candidates.append((_build_snapshot_entry(skill_file, skills_dir, frontmatter, desc), is_compatible))
     # Every tier is resolved together, exactly as skill_view resolves names (agent.skill_utils precedence:
@@ -1421,10 +1424,10 @@ def _build_skills_system_prompt_inner(
     project_roots = [d for t, d in extra_roots if t == TIER_PROJECT and d.exists()]
     rows: list[tuple[dict, bool]] = []
     for root in project_roots:
-        rows += _scan_extra_root(root, iter_project_skill_files(root), TIER_PROJECT, "Error reading project skill %s: %s")
+        rows += _scan_extra_root(root, iter_project_skill_files(root, seen=seen_dirs), TIER_PROJECT, "Error reading project skill %s: %s")
     rows += [({**entry, "tier": TIER_LOCAL, "root": skills_dir}, ok) for entry, ok in candidates]
     for tier, root in ((t, d) for t, d in extra_roots if t != TIER_PROJECT and d.exists()):
-        rows += _scan_extra_root(root, iter_skill_index_files(root, "SKILL.md"), tier, "Error reading external skill %s: %s")
+        rows += _scan_extra_root(root, iter_skill_index_files(root, "SKILL.md", seen=seen_dirs), tier, "Error reading external skill %s: %s")
     resolved = resolve_skill_catalog([
         {**entry, "name": _entry_name(entry), "path": entry["root"] / entry["rel"],
          "visible": ok and not hides(entry.get("skill_name") or "", entry.get("conditions") or {})}
