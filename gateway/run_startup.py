@@ -623,6 +623,15 @@ class GatewayStartupMixin:
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
+        if os.environ.get("HERMES_RECOVERY_HOLD") == "1":
+            # Operator hold: a gateway started while sessions are being audited must not synthesize
+            # turns on their behalf. Set by the 90-recovery-hold.conf drop-in; removing it is the
+            # deliberate act that re-enables resumption.
+            logger.warning(
+                "RECOVERY HOLD ACTIVE: automatic interrupted-session resumption disabled"
+            )
+            return 0
+
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
