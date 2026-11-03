@@ -416,8 +416,21 @@ def get_skill_search_roots(local: Optional[Path] = None, *, include_project: boo
     if create_dir is not None and create_dir.is_dir():
         roots.append((TIER_CREATE_DIR, create_dir))
     roots += [(TIER_EXTERNAL, d) for d in get_external_skills_dirs()]
-    seen: set[Path] = set()
-    return [(t, d) for t, d in roots if not (d in seen or seen.add(d))]
+    # Drop duplicates AND roots nested inside an earlier (higher-precedence) root: the same
+    # corpus configured twice — or an external dir under the local skills dir — would otherwise
+    # be walked once per root, and a bundle that links its own tree would be walked forever.
+    kept: list[tuple[int, Path]] = []
+    kept_real: list[Path] = []
+    for tier, d in roots:
+        try:
+            real = Path(os.path.realpath(d))
+        except OSError:
+            real = d
+        if any(real == prev or real.is_relative_to(prev) for prev in kept_real):
+            continue
+        kept.append((tier, d))
+        kept_real.append(real)
+    return kept
 
 
 def get_all_skills_dirs() -> list[Path]:
@@ -654,11 +667,12 @@ def is_quarantined_project_skill(skill_md) -> bool:
     return quarantined
 
 
-def iter_project_skill_files(project_dir: Path):
+def iter_project_skill_files(project_dir: Path, *, seen: Optional[Set[Tuple[int, int]]] = None):
     """Yield non-quarantined SKILL.md files under a trusted project dir — the
     single iteration chokepoint for the project tier, so the quarantine cannot
     be bypassed by a call site forgetting the check."""
-    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md") if not is_quarantined_project_skill(p))
+    yield from (p for p in iter_skill_index_files(project_dir, "SKILL.md", seen=seen)
+                if not is_quarantined_project_skill(p))
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:
@@ -871,15 +885,87 @@ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bo
     return len(_normalize_skill_description(frontmatter)) > SKILL_PROMPT_DESC_LIMIT
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
-    """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
-    matches: list[str] = []
+# A skills root is scanned on every turn (prompt index) and every command-menu rebuild
+# (gateway platforms), so the walk must stay linear in *real* directories. A symlinked bundle
+# that points back into the tree — a self-link, a link to an ancestor, the same bundle linked
+# from two places, two overlapping roots — otherwise expands until the path-length cap, which
+# is what turned skill discovery into an unbounded scan. The cap below is a backstop only.
+SKILL_WALK_DIR_LIMIT = 50_000
+
+
+def _dir_identity(path: str) -> Optional[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` for *path* following symlinks, or None when it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def walk_skill_dirs(
+    skills_dir,
+    *,
+    seen: Optional[Set[Tuple[int, int]]] = None,
+    max_dirs: int = SKILL_WALK_DIR_LIMIT,
+):
+    """``os.walk(..., followlinks=True)`` that descends each real directory at most once.
+
+    Yields ``(root, dirs, files)`` for every directory under *skills_dir*, pruning
+    EXCLUDED_SKILL_DIRS and support dirs of a skill (the same rules as
+    :func:`iter_skill_index_files`), but keyed on directory identity: a directory reachable
+    twice — symlink loop, link to an ancestor, a bundle linked from two paths, or a second root
+    sharing *seen* — is descended once. Legitimate symlinked skills still yield the path they
+    were first reached by, and a root already covered by an earlier walk in the same *seen*
+    yields nothing.
+
+    A directory's identity is claimed when its PARENT is scanned, before any descent, so the
+    shallowest path to a directory wins: a skill reached both as ``skills/<cat>/<name>`` and as
+    ``skills/<cat>/<bundle>/.tmp/.../research/<name>`` is reported under the first, and the
+    canonical path is not lost to a bundle that happens to sort earlier.
+
+    *max_dirs* caps the number of directories yielded so a pathological tree degrades to a
+    bounded scan instead of unbounded memory.
+    """
+    visited = seen if seen is not None else set()
+    root_identity = _dir_identity(str(skills_dir))
+    if root_identity is not None:
+        if root_identity in visited:
+            return
+        visited.add(root_identity)
+    walked = 0
     for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
         has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
-        if filename in files:
-            matches.append(os.path.join(root, filename))
+        kept: list[str] = []
+        for name in sorted(dirs):
+            if name in EXCLUDED_SKILL_DIRS or (has_skill_md and name in SKILL_SUPPORT_DIRS):
+                continue
+            identity = _dir_identity(os.path.join(root, name))
+            # Unstatable (broken link) or already-walked directory: never descend again.
+            if identity is None or identity in visited:
+                continue
+            visited.add(identity)
+            kept.append(name)
+        dirs[:] = kept
+        walked += 1
+        if walked > max_dirs:
+            logger.warning(
+                "Skill walk of %s stopped after %d directories (SKILL_WALK_DIR_LIMIT); "
+                "check for symlinked bundles that re-enter the tree.", skills_dir, max_dirs)
+            return
+        yield root, dirs, files
+
+
+def iter_skill_index_files(skills_dir: Path, filename: str, *, seen: Optional[Set[Tuple[int, int]]] = None):
+    """Walk skills_dir yielding sorted paths matching *filename*; prunes
+    EXCLUDED_SKILL_DIRS and support dirs of skill roots.
+
+    Cycle-safe: see :func:`walk_skill_dirs`. Pass a shared *seen* set to scan several
+    overlapping roots without visiting the same directory twice."""
+    matches: list[str] = [
+        os.path.join(root, filename)
+        for root, _dirs, files in walk_skill_dirs(str(skills_dir), seen=seen)
+        if filename in files
+    ]
     yield from map(Path, sorted(matches))
 
 
