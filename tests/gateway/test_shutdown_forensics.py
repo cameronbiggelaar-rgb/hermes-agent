@@ -165,3 +165,82 @@ class TestParseSystemdDuration:
 # ---------------------------------------------------------------------------
 # check_systemd_timing_alignment
 # ---------------------------------------------------------------------------
+
+class TestSystemdTimingAlignment:
+    """`systemctl show` answers for units that do not exist, with the compiled-in default and rc=0.
+    Reading that as this process's unit reported a phantom "stale unit" warning for a system-scope
+    gateway whose effective TimeoutStopSec was 210s; the same shortcut would report false alignment
+    the other way round for a short --user unit shadowing a short system unit."""
+
+    NOT_FOUND = {"LoadState": "not-found", "TimeoutStopUSec": "1min 30s"}
+
+    def _scopes(self, monkeypatch, replies):
+        calls: list[list[str]] = []
+
+        def show(unit_name, flag):
+            calls.append(flag)
+            assert unit_name == "hermes-gateway.service"
+            return replies.get("user" if flag else "system", self.NOT_FOUND)
+
+        monkeypatch.setattr(sf, "_systemctl_show", show)
+        return calls
+
+    def test_user_scope_without_a_unit_does_not_shadow_the_system_unit(self, monkeypatch):
+        # The live shape: no --user unit (not-found + default 90s), system unit at 3min 30s.
+        self._scopes(monkeypatch, {
+            "user": self.NOT_FOUND,
+            "system": {"LoadState": "loaded", "TimeoutStopUSec": "3min 30s"},
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 210 * 1_000_000
+
+    def test_loaded_user_unit_is_preferred(self, monkeypatch):
+        calls = self._scopes(monkeypatch, {
+            "user": {"LoadState": "loaded", "TimeoutStopUSec": "200000000"},
+            "system": {"LoadState": "loaded", "TimeoutStopUSec": "90s"},
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 200_000_000
+        assert calls == [["--user"]]
+
+    def test_no_loaded_unit_anywhere_is_undeterminable(self, monkeypatch):
+        self._scopes(monkeypatch, {"user": self.NOT_FOUND, "system": self.NOT_FOUND})
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") is None
+
+    def test_unparseable_timeout_falls_through_to_the_next_scope(self, monkeypatch):
+        self._scopes(monkeypatch, {
+            "user": {"LoadState": "loaded", "TimeoutStopUSec": "wat"},
+            "system": {"LoadState": "loaded", "TimeoutStopUSec": "3min"},
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 180 * 1_000_000
+
+    def test_failed_systemctl_call_is_skipped(self, monkeypatch):
+        self._scopes(monkeypatch, {
+            "user": None,
+            "system": {"LoadState": "loaded", "TimeoutStopUSec": "210s"},
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 210 * 1_000_000
+
+    def test_mismatch_when_the_unit_is_short(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "probe")
+        monkeypatch.setattr(sf, "_running_unit_name", lambda: "hermes-gateway.service")
+        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 90 * 1_000_000)
+        got = sf.check_systemd_timing_alignment(180.0, 30.0)
+        assert got is not None and got["mismatch"] is True
+        assert got["timeout_stop_sec"] == 90.0 and got["expected_min"] >= 180.0
+
+    def test_aligned_unit_is_silent(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "probe")
+        monkeypatch.setattr(sf, "_running_unit_name", lambda: "hermes-gateway.service")
+        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 210 * 1_000_000)
+        got = sf.check_systemd_timing_alignment(180.0, 30.0)
+        assert got is not None and got["mismatch"] is False
+
+    def test_outside_systemd_is_silent(self, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 1)
+        assert sf.check_systemd_timing_alignment(180.0) is None
+
+    def test_scope_without_a_service_unit_is_silent(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "probe")
+        monkeypatch.setattr(sf, "_running_unit_name", lambda: None)
+        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 1)
+        assert sf.check_systemd_timing_alignment(180.0) is None

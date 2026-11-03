@@ -209,14 +209,7 @@ def check_systemd_timing_alignment(
     """
     if not os.environ.get("INVOCATION_ID"):
         return None  # Not running under systemd (or at least not directly)
-    # /proc/self/cgroup: "0::/user.slice/.../hermes-gateway.service"
-    unit_name: Optional[str] = None
-    with contextlib.suppress(OSError), open("/proc/self/cgroup", encoding="utf-8") as fh:
-        for line in fh:
-            parts = reversed(line.strip().split("/"))
-            unit_name = next((p for p in parts if p.endswith(".service")), None)
-            if unit_name:
-                break
+    unit_name = _running_unit_name()
     if (timeout_us := _systemd_timeout_stop_us(unit_name) if unit_name else None) is None:
         return None
     timeout_stop_sec = timeout_us / 1_000_000.0
@@ -226,25 +219,58 @@ def check_systemd_timing_alignment(
             "mismatch": timeout_stop_sec < expected}
 
 
+def _running_unit_name() -> Optional[str]:
+    """The ``.service`` unit this process runs in, from ``/proc/self/cgroup``.
+
+    ``0::/system.slice/hermes-gateway.service`` -> ``hermes-gateway.service``; ``None`` in a scope
+    (a session, a container) or when the file cannot be read.
+    """
+    with contextlib.suppress(OSError), open("/proc/self/cgroup", encoding="utf-8") as fh:
+        for line in fh:
+            parts = reversed(line.strip().split("/"))
+            unit_name = next((p for p in parts if p.endswith(".service")), None)
+            if unit_name:
+                return unit_name
+    return None
+
+
 def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
-    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual)."""
+    """``TimeoutStopUSec`` of an *existing* ``unit_name`` in microseconds; ``--user`` first (hermes' usual).
+
+    A scope that has no such unit still answers ``systemctl show`` with rc=0 and the compiled-in
+    default (``LoadState=not-found``, ``TimeoutStopUSec=1min 30s``). Taking that reply at face value
+    reported a phantom mismatch for a system-scope gateway whose effective timeout was 3min 30s --
+    and, in the other direction, would report alignment for a short ``--user`` unit while the
+    running system unit lacked the margin. Only a loaded unit's value describes this process.
+    """
     for flag in (["--user"], []):
-        try:
-            result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
-                check=False,
-            )
-        except (subprocess.TimeoutExpired, OSError):
+        props = _systemctl_show(unit_name, flag)
+        if props is None or props.get("LoadState") != "loaded":
             continue
         # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
-        for line in result.stdout.splitlines() if result.returncode == 0 else ():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    return timeout_us
+        value = props.get("TimeoutStopUSec", "").strip()
+        timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
+        if timeout_us is not None:
+            return timeout_us
     return None
+
+
+def _systemctl_show(unit_name: str, flag: list[str]) -> Optional[dict[str, str]]:
+    """``systemctl [--user] show`` properties for ``unit_name``; ``None`` when the call fails.
+
+    Split out so tests can drive the scope-selection rule without touching ``subprocess``.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", *flag, "show", unit_name, "--property=LoadState,TimeoutStopUSec"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
 
 def parse_systemd_duration_to_us(raw: str) -> Optional[int]:
