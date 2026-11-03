@@ -25,7 +25,9 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
-    effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
+    SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S,
+    effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget,
+    systemd_stop_budget,
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
@@ -2178,6 +2180,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             "effective_drain_timeout": effective_stop_drain_timeout(self),
             "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
             "systemd_timeout_stop_s": getattr(self, "_systemd_timeout_stop_sec", None),
+            "systemd_stop_budget_source": systemd_stop_budget(self)[1],
             "watchdog_delay_s": _effective_watchdog_leash(self),
             "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,
         }
@@ -2206,11 +2209,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             timeout = effective_stop_drain_timeout(self)
             if timeout < self._restart_drain_timeout:
                 _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
-                _systemd_budget = getattr(self, "_systemd_timeout_stop_sec", None)
                 if _launchd_budget:
                     _source, _budget = "live launchd exit timeout", _launchd_budget
                 else:
-                    _source, _budget = "live systemd TimeoutStopSec", _systemd_budget or 0.0
+                    _systemd_budget, _systemd_source = systemd_stop_budget(self)
+                    if _systemd_source == "managed-no-budget":
+                        _source = "assumed systemd stop floor (TimeoutStopSec unreadable)"
+                        _budget = SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S
+                    else:
+                        _source, _budget = "live systemd TimeoutStopSec", _systemd_budget or 0.0
                 logger.warning(
                     "Shutdown drain capped to %.0fs (configured %.0fs) to fit inside the %s of "
                     "%.0fs with room for teardown — the service manager SIGKILLs past it",

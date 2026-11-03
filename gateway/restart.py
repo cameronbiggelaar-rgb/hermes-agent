@@ -1,13 +1,17 @@
 """Shared gateway restart constants and supervisor detection helpers."""
 
+import logging
 import math
 import os
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Mapping
 
 from hermes_cli.config import DEFAULT_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # EX_TEMPFAIL (sysexits.h): ask the service manager to restart after a graceful drain/reload.
 GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
@@ -72,6 +76,16 @@ CRON_DRAIN_CLEANUP_RESERVE_S = 10.0
 # cutover, so retiring the temporary drop-in changes no runtime behaviour.
 SYSTEMD_STOP_HEADROOM_S = 120.0
 SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
+# Smallest stop budget this code can hand systemd: resolve_systemd_timeout_stop_sec() never returns
+# less than the floor above. When the process is demonstrably a systemd service but the live
+# TimeoutStopSec cannot be read (systemctl missing, no bus, unparsable or non-finite value), that
+# floor is the only budget we can prove, so the drain is sized against it. Leaving the configured
+# drain untouched instead — the old fail-open — re-armed the SIGKILL the cap exists to prevent, and
+# did so silently on exactly the hosts where the unit is unknown (stale or hand-edited).
+SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S = SYSTEMD_TIMEOUT_STOP_SEC_FLOOR
+# Post-drain phases the assumed floor cannot fit (settle alone budgets 45s). A stop that has to run
+# inside the floor therefore interrupts immediately: a turn cut at SIGTERM is recoverable
+# (resume_pending, session state persisted), a SIGKILL mid-SQLite-write is not.
 # Reserve the *live* TimeoutStopSec must still hold once the drain returns: the post-drain phases
 # (interrupt, settle, finalize adapters, quiesce, close SessionDB, persist exit). Applied as a cap on
 # the drain itself so a stale/undersized unit (e.g. the shipped 210s with a 180s drain) can never
@@ -214,9 +228,10 @@ def resolve_systemd_capped_drain(
 
     systemd's stop clock starts at SIGTERM and covers the whole stop: drain + interrupt + settle +
     finalize + quiesce + close.  A drain sized equal to (or near) the unit timeout therefore leaves
-    the teardown to be SIGKILLed — the exact failure a 300s drop-in was masking.  Fail-open: an
-    unknown, zero, negative or non-finite budget keeps the configured drain unchanged (tests and
-    non-systemd supervisors never lose their budget to a probe failure).
+    the teardown to be SIGKILLed — the exact failure a 300s drop-in was masking.  An unknown, zero,
+    negative or non-finite budget keeps the configured drain unchanged: this function stays a pure
+    "cap by a known budget".  Callers decide what an *unknown* budget means via
+    :func:`systemd_stop_budget` — under systemd it must fail closed, not open.
     """
     drain = _seconds(drain_timeout)
     unit = _seconds(timeout_stop_s)
@@ -228,6 +243,104 @@ def resolve_systemd_capped_drain(
     return max(0.0, min(drain, unit - reserve))
 
 
+def coerce_stop_budget_s(value: object) -> float | None:
+    """A usable stop budget in seconds, or ``None`` for absent/invalid data.
+
+    One predicate for every reader of a supervisor stop budget: a probe that answers ``0``,
+    ``-5``, ``nan``, ``inf`` or ``"180s"`` is not a budget, and treating it as one is how an
+    unreadable unit turned into an unbounded drain.
+    """
+    try:
+        budget = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(budget) or budget <= 0.0:
+        return None
+    return budget
+
+
+_SYSTEMD_ENV_MARKERS = ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "NOTIFY_SOCKET")
+_SYSTEMD_CGROUP_PATH = "/proc/self/cgroup"
+
+
+def systemd_managed(environ: Mapping[str, str] | None = None, cgroup_text: str | None = None) -> bool:
+    """True when this process is a systemd *service*, i.e. some ``TimeoutStopSec`` will kill it.
+
+    Env markers first (they survive a `/proc` read failure), then the cgroup unit path:
+    ``0::/system.slice/hermes-gateway.service`` yes, ``.scope`` (login session, container,
+    ``systemd-run --scope``) no — a scope's stop budget is not this process's budget, and treating
+    it as one would cap the drain of a gateway started by hand from a login shell.
+    """
+    env = os.environ if environ is None else environ
+    if any(str(env.get(var, "") or "").strip() for var in _SYSTEMD_ENV_MARKERS):
+        return True
+    if cgroup_text is None:
+        try:
+            with open(_SYSTEMD_CGROUP_PATH, encoding="utf-8") as fh:
+                cgroup_text = fh.read()
+        except OSError:
+            return False
+    return any(part.endswith(".service") for line in cgroup_text.splitlines() for part in line.split("/"))
+
+
+def systemd_stop_budget(runner: object) -> tuple[float | None, str]:
+    """``(budget_seconds, source)`` for the stop in progress on ``runner``.
+
+    ``source`` is one of:
+
+    * ``"probe"`` — the boot-time probe read a finite, positive live ``TimeoutStopSec``.
+    * ``"managed-no-budget"`` — this *is* a systemd service but the budget is unknown or invalid.
+      Callers must size the drain against :data:`SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S`, not the
+      configured drain: an unreadable unit is the case the cap exists for.
+    * ``"unmanaged"`` — no systemd stop clock applies (tests, bare doubles, launchd, a session
+      scope), so the configured drain stands.
+
+    A runner without the probe attribute at all is a duck-typed double, not a ``GatewayRunner``:
+    it is never treated as managed.
+    """
+    if not hasattr(runner, "_systemd_timeout_stop_sec"):
+        return None, "unmanaged"
+    budget = coerce_stop_budget_s(getattr(runner, "_systemd_timeout_stop_sec", None))
+    if budget is not None:
+        return budget, "probe"
+    return None, "managed-no-budget" if systemd_managed() else "unmanaged"
+
+
+_STOP_BUDGET_WARNING_LOCK = threading.Lock()
+_STOP_BUDGET_WARNING_SHOWN = False
+
+
+def _warn_unverified_stop_budget() -> None:
+    """Say, once per process, that the stop is being sized against an assumed budget."""
+    global _STOP_BUDGET_WARNING_SHOWN
+    with _STOP_BUDGET_WARNING_LOCK:
+        if _STOP_BUDGET_WARNING_SHOWN:
+            return
+        _STOP_BUDGET_WARNING_SHOWN = True
+    logger.warning(
+        "Running as a systemd service but the live TimeoutStopSec is unreadable (systemctl missing, "
+        "no bus, or an invalid value) — assuming the %.0fs floor (resolve_systemd_timeout_stop_sec "
+        "minimum) and interrupting the drain immediately instead of spending the whole envelope. "
+        "Check `systemctl show -p TimeoutStopUSec <unit>`, then `hermes gateway install --force`.",
+        SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S,
+    )
+
+
+def resolve_stop_drain_budget(runner: object, drain_timeout: object) -> float:
+    """``drain_timeout`` capped to the stop envelope this runner can prove, failing closed.
+
+    Shared by the drain and the watchdog leash so both sit inside the same budget. Under systemd an
+    unknown budget is *not* "no cap": it is the floor, which for the shipped 180s drain means drain
+    0 (interrupt now) rather than a guaranteed SIGKILL.
+    """
+    budget, source = systemd_stop_budget(runner)
+    if source == "managed-no-budget":
+        _warn_unverified_stop_budget()
+        budget = SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S
+    return resolve_systemd_capped_drain(drain_timeout, budget)
+
+
+
 def effective_stop_drain_timeout(runner: object) -> float:
     """Drain budget for the stop in progress on ``runner``.
 
@@ -236,14 +349,15 @@ def effective_stop_drain_timeout(runner: object) -> float:
     everything else — in-band SIGUSR1 restart after the turn, ``--replace``
     takeover, tests — keeps the configured drain, except that any stop under
     systemd is capped by the live ``TimeoutStopSec`` (``runner._systemd_timeout_stop_sec``,
-    set at boot from the same probe that logs the alignment warning). Duck-typed and
-    getattr-guarded on purpose: shutdown-path tests drive ``_stop_impl``
+    set at boot from the same probe that logs the alignment warning). An unreadable budget on a
+    systemd-managed host fails closed against the assumed floor (:func:`systemd_stop_budget`).
+    Duck-typed and getattr-guarded on purpose: shutdown-path tests drive ``_stop_impl``
     from bare doubles that are not ``GatewayRunner`` instances.
     """
     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
     if getattr(runner, "_stop_requested_by_signal", False):
         drain = resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
-    return resolve_systemd_capped_drain(drain, getattr(runner, "_systemd_timeout_stop_sec", None))
+    return resolve_stop_drain_budget(runner, drain)
 
 
 def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> float:
@@ -255,7 +369,9 @@ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> floa
     can never fire, so the forensic stack dump and ``os._exit`` the watchdog
     exists for are lost. Clamp the leash to ``ExitTimeOut -
     LAUNCHD_WATCHDOG_DUMP_MARGIN_S`` so the dump lands before SIGKILL. Same
-    duck-typing / fail-open rules as :func:`effective_stop_drain_timeout`.
+    duck-typing rules as :func:`effective_stop_drain_timeout`; the systemd clamp reuses the
+    same stop-budget resolution, so an unreadable unit shortens the leash rather than losing
+    the dump to SIGKILL.
     """
     leash = _seconds(watchdog_delay)
     if getattr(runner, "_stop_requested_by_signal", False):
@@ -263,8 +379,12 @@ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> floa
             leash, getattr(runner, "_launchd_exit_timeout_s", None), cleanup_reserve_s=LAUNCHD_WATCHDOG_DUMP_MARGIN_S,
         )
     # Under systemd the leash must fire before TimeoutStopSec or the forensic dump is lost to SIGKILL.
+    budget, source = systemd_stop_budget(runner)
+    if source == "managed-no-budget":
+        _warn_unverified_stop_budget()
+        budget = SYSTEMD_UNKNOWN_BUDGET_ASSUMED_S
     return resolve_systemd_capped_drain(
-        leash, getattr(runner, "_systemd_timeout_stop_sec", None),
+        leash, budget,
         cleanup_reserve_s=SYSTEMD_WATCHDOG_DUMP_MARGIN_S,
     )
 

@@ -24,7 +24,8 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
-    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
+    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, coerce_stop_budget_s,
+    is_global_startup_conflict, systemd_stop_budget, _warn_unverified_stop_budget,
 )
 from gateway.run_shutdown import _log_suppressed, _send_error
 from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
@@ -1041,11 +1042,14 @@ class GatewayStartupMixin:
             )
             if _alignment is not None:
                 # Remember the *live* budget so the stop path can size the drain and the watchdog
-                # leash inside it (see gateway.restart.effective_stop_drain_timeout).
-                try:
-                    self._systemd_timeout_stop_sec = float(_alignment["timeout_stop_sec"])
-                except (KeyError, TypeError, ValueError):
-                    self._systemd_timeout_stop_sec = None
+                # leash inside it (see gateway.restart.effective_stop_drain_timeout). Validate it
+                # here: a probe answer of 0 / nan / inf is not a budget, and storing it as one
+                # would leave the drain uncapped on the one host that most needed the cap.
+                self._systemd_timeout_stop_sec = coerce_stop_budget_s(_alignment.get("timeout_stop_sec"))
+            # Unreadable budget while running as a systemd service is not "no budget": say so at boot
+            # (once per process) rather than discovering it during a stop.
+            if systemd_stop_budget(self)[1] == "managed-no-budget":
+                _warn_unverified_stop_budget()
             if _alignment is not None and _alignment.get("mismatch"):
                 logger.warning(
                     "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but drain_timeout=%.0fs "

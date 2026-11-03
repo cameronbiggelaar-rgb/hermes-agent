@@ -55,7 +55,10 @@ class TestCappedDrain:
         assert resolve_systemd_capped_drain(180.0, 50.0) == 0.0
 
     @pytest.mark.parametrize("budget", [None, 0, 0.0, -5, "unknown", float("nan"), float("inf")])
-    def test_unknown_budget_fails_open_to_the_configured_drain(self, budget):
+    def test_pure_cap_ignores_an_unknown_budget_but_the_caller_must_fail_closed(self, budget):
+        # resolve_systemd_capped_drain stays a pure "cap by a known budget"; the fail-closed
+        # decision for an unknown budget lives in effective_stop_drain_timeout (see
+        # test_stop_budget_probe_failclosed.py, which pins drain 0 on a managed host).
         assert resolve_systemd_capped_drain(180.0, budget) == 180.0
 
     def test_applies_to_in_band_restart_too_not_only_signal_stops(self):
@@ -81,7 +84,12 @@ class TestCappedWatchdog:
         leash = resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner))
         assert effective_stop_watchdog_delay(runner, leash) == leash
 
-    def test_launchd_margin_still_wins_under_launchd(self):
+    def test_launchd_margin_still_wins_under_launchd(self, monkeypatch):
+        # Declare the host as non-systemd: this test is about launchd's budget, and the gateway
+        # runs with no systemd TimeoutStopSec to cap against.
+        import gateway.restart as rs
+
+        monkeypatch.setattr(rs, "systemd_managed", lambda *a, **k: False)
         runner = _runner(_stop_requested_by_signal=True, _launchd_exit_timeout_s=60.0)
         assert effective_stop_watchdog_delay(runner, 110.0) == 60.0 - LAUNCHD_WATCHDOG_DUMP_MARGIN_S
 
