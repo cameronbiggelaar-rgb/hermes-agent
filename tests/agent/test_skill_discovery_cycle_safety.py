@@ -255,3 +255,213 @@ def test_telegram_command_discovery_is_bounded_on_a_cyclic_tree(tmp_path, monkey
     assert "alpha" in names and "beta" in names
     assert len(names) == len(set(names))
     assert hidden == 0
+
+
+# ---------------------------------------------------------------------------
+# EXT-SKILL-001: a configured root is only "covered" by a parent root when the
+# parent's own walk actually reaches it. A root under a skill's references/ (or
+# under .git/node_modules) is pruned by the parent scanner, so dropping it by
+# realpath ancestry would silently delete those skills from every surface.
+# ---------------------------------------------------------------------------
+
+def _roots(monkeypatch, local: Path, *, project=(), external=()):
+    """get_skill_search_roots() for an isolated config."""
+    monkeypatch.setattr("agent.skill_utils.get_project_skills_dirs", lambda: list(project))
+    monkeypatch.setattr("agent.skill_utils.get_skill_create_dir", lambda: None)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: list(external))
+    return get_skill_search_roots(local)
+
+
+def _scan_all(roots):
+    """Catalog-equivalent scan: every root, one shared identity set."""
+    seen: set[tuple[int, int]] = set()
+    return [p for _tier, root in roots for p in iter_skill_index_files(root, "SKILL.md", seen=seen)]
+
+
+def test_root_under_a_support_dir_is_not_dropped(tmp_path, monkeypatch):
+    """An external root inside a skill's references/ is pruned from the parent walk — keep it."""
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "beta")
+
+    roots = _roots(monkeypatch, skills, external=[ext])
+    found = {p.parent.name for p in _scan_all(roots)}
+
+    assert ext in [d for _tier, d in roots]
+    assert found == {"alpha", "beta"}
+
+
+def test_root_under_an_excluded_dir_is_not_dropped(tmp_path, monkeypatch):
+    """Same rule for VCS/dependency dirs, which the parent walk also refuses to enter."""
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    ext = alpha / "node_modules" / "vendor-skills"
+    _skill(ext, "gamma")
+
+    roots = _roots(monkeypatch, skills, external=[ext])
+
+    assert {p.parent.name for p in _scan_all(roots)} == {"alpha", "gamma"}
+
+
+def test_reachable_nested_root_is_still_dropped(tmp_path, monkeypatch):
+    """A root the parent walk does reach is still collapsed — dedupe must not regress."""
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    nested = alpha / "nested"
+    _skill(nested, "beta")
+
+    roots = _roots(monkeypatch, skills, external=[nested])
+
+    assert [d for _tier, d in roots] == [skills]
+    assert {p.parent.name for p in _scan_all(roots)} == {"alpha", "beta"}  # found via parent
+
+
+def test_kept_nested_root_keeps_its_tier_and_precedence(tmp_path, monkeypatch):
+    """A root rescued from a pruned subtree stays external: local still wins a name clash."""
+    from agent.skill_utils import TIER_EXTERNAL, TIER_LOCAL
+
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    local_shared = _skill(skills, "shared")
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "shared")
+
+    roots = _roots(monkeypatch, skills, external=[ext])
+
+    assert [(t, d) for t, d in roots] == [(TIER_LOCAL, skills), (TIER_EXTERNAL, ext)]
+    # Precedence is a tier property, not an iteration-order one: the local copy wins the name.
+    from agent.skill_utils import resolve_skill_catalog
+
+    entries = [
+        {"name": p.parent.name, "tier": t, "root": d, "path": p}
+        for t, d in roots
+        for p in iter_skill_index_files(d, "SKILL.md")
+    ]
+    shared = [e for e in resolve_skill_catalog(entries) if e["name"] == "shared"]
+
+    assert [(e["tier"], e["status"], Path(e["path"]).parent) for e in shared] == [
+        (TIER_LOCAL, "unique", local_shared),
+        (TIER_EXTERNAL, "shadowed", ext / "shared"),
+    ]
+
+
+def test_project_root_behind_a_pruned_dir_keeps_quarantine(tmp_path, monkeypatch):
+    """The project tier still routes through the quarantine chokepoint after root selection."""
+    from agent.skill_utils import iter_project_skill_files
+
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    proj = alpha / "references" / "project-skills"
+    good = _skill(proj, "good")
+    bad = _skill(proj, "bad")
+    monkeypatch.setattr(
+        "agent.skill_utils.is_quarantined_project_skill",
+        lambda p: Path(p).parent.name == "bad",
+    )
+
+    roots = _roots(monkeypatch, skills, project=[proj])
+
+    # Project root is higher precedence and kept; the local root is not nested inside it.
+    assert proj in [d for _tier, d in roots]
+    assert list(iter_project_skill_files(proj)) == [good / "SKILL.md"]
+    # ...and the trusted local tier is NOT quarantined: the verdict belongs to the chokepoint.
+    assert bad / "SKILL.md" in _scan_all(roots)
+
+
+def test_cache_signature_covers_exactly_the_directories_the_walk_visits(tmp_path):
+    """Cache-signature consistency: the stat signature must record the same dirs the catalog walks.
+
+    If the signature visited a different set, the catalog cache could serve stale rows (a change
+    the walk sees but the signature misses) or churn (a signature that grows with a re-entrant
+    bundle). Both traversals dedupe on inode identity and share the same pruning rules.
+    """
+    from agent.skill_utils import walk_skill_dirs
+    from tools.skills_tool import _skills_scan_signature
+
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    # legitimately symlinked skill, living outside the root
+    repo = tmp_path / "external-repo"
+    _skill(repo, "beta")
+    (skills / "beta").symlink_to(repo / "beta", target_is_directory=True)
+    # re-entrant bundle
+    bundle = alpha / ".tmp" / "bound-skills" / "research"
+    bundle.mkdir(parents=True)
+    (bundle / "back").symlink_to(skills, target_is_directory=True)
+    # configured root the parent walk prunes (EXT-SKILL-001)
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "gamma")
+    roots = [skills, ext]
+
+    signature, _disabled, _platform = _skills_scan_signature(roots, set())
+    sig_dirs = {path for path, _mtime, _names in signature}
+    seen: set[tuple[int, int]] = set()
+    walk_dirs = {root for r in roots for root, _d, _f in walk_skill_dirs(r, seen=seen)}
+
+    assert sig_dirs == walk_dirs
+    assert _skills_scan_signature(roots, set())[0] == signature  # stable without changes
+
+    # A change inside the rescued root invalidates the cache...
+    assert str(ext) in sig_dirs
+    _skill(ext, "delta")
+    assert _skills_scan_signature(roots, set())[0] != signature
+
+    # ...while content under a pruned support dir cannot, because neither traversal enters it.
+    after = _skills_scan_signature(roots, set())[0]
+    (alpha / "references" / "notes").mkdir()
+    assert _skills_scan_signature(roots, set())[0] == after
+
+
+def test_catalog_surface_sees_a_root_behind_a_support_dir(tmp_path, monkeypatch):
+    """End to end: the tool catalog (not just the root list) discovers a rescued root's skills."""
+    from tools import skills_tool as st
+
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "beta")
+
+    monkeypatch.setattr(st, "_skills_dir", lambda: skills)
+    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [ext])
+    monkeypatch.setattr("agent.skill_utils.get_skill_create_dir", lambda: None)
+    st._SKILLS_CACHE.clear()
+
+    assert {row["name"] for row in st._skill_catalog()} == {"alpha", "beta"}
+
+
+def test_symlinked_configured_root_into_a_pruned_dir_is_kept_once(tmp_path, monkeypatch):
+    """A configured root is usually a symlink; two links to one pruned target must scan once."""
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "beta")
+    first, second = tmp_path / "ext-a", tmp_path / "ext-b"
+    first.symlink_to(ext, target_is_directory=True)
+    second.symlink_to(ext, target_is_directory=True)
+
+    roots = [d for _tier, d in _roots(monkeypatch, skills, external=[first, second])]
+    found = _scan_all(_roots(monkeypatch, skills, external=[first, second]))
+
+    assert roots == [skills, first]  # second is an alias of the same real root
+    assert {p.parent.name for p in found} == {"alpha", "beta"}
+
+
+def test_root_selection_does_not_walk_the_tree(tmp_path, monkeypatch):
+    """EXT-SKILL-001 fix must stay a path test: no scan, no descent, no recursion."""
+    import os as os_mod
+
+    skills = _skills_root(tmp_path)
+    alpha = _skill(skills, "alpha")
+    ext = alpha / "references" / "ext-skills"
+    _skill(ext, "beta")
+
+    scans: list[str] = []
+    real_scandir = os_mod.scandir
+    monkeypatch.setattr(os_mod, "scandir", lambda *a, **k: (scans.append(str(a)), real_scandir(*a, **k))[1])
+
+    roots = [d for _tier, d in _roots(monkeypatch, skills, external=[ext])]
+
+    assert roots == [skills, ext]
+    assert scans == []  # root selection never lists a directory
