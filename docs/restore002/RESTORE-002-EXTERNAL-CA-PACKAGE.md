@@ -1,10 +1,12 @@
-# HERMES-RESTORE-002 — External CA review package (correction 6)
+# HERMES-RESTORE-002 — External CA review package (correction 7)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
 prerequisites the External CA raised against PR #9 (EXT-01/02), the three release-orchestration
 findings raised against the corrected candidate (EXT-03 launcher integrity, EXT-04 cutover
-admission control, EXT-05 supervisor lifecycle), and the single bounded release procedure.
+admission control, EXT-05 supervisor lifecycle, EXT-06..11 phase and checksum contracts), the
+release-manifest completeness defect the first owner-approved attempt exposed (EXT-12), and the
+single bounded release procedure.
 
 Nothing in this package has been deployed, merged, restarted or activated. The live service is
 exactly as RESTORE-001 left it.
@@ -14,7 +16,8 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling, incl. EXT-06..11) | **`7596026ab684d4b52935388bfc17bcaa948f2387`**, tree **`7e6042d786509439badf8eba554bd9890f039ab0`** |
+| **release candidate** (code + tests + tooling, incl. EXT-12) | **`d4a5ef0a038ba1f4a9796291a445d09713ea5a28`**, tree **`7cc9304fb8d11ae6100d002b4b66ad556ab90a5a`** |
+| previous candidate (EXT-06..11, superseded by EXT-12 — its release authority is exhausted and does not transfer) | `7596026ab684d4b52935388bfc17bcaa948f2387`, tree `7e6042d786509439badf8eba554bd9890f039ab0` |
 | previous candidate (EXT-06..10, superseded by EXT-11) | `a4f08d6315072e6057984ae74dbf289736f9d110`, tree `27f8916b1eafbad3328e09139c21c7654645fe99` |
 | previous candidate (EXT-06..09, superseded by EXT-10) | `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`, tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b` |
 | previous candidate (EXT-03/04/05) | `1cc36452f47cef911afde6da5139a56e9de2da7e`, tree `2ec9f4718f776f28e232b8aeffd5386f803a8258` |
@@ -22,10 +25,10 @@ exactly as RESTORE-001 left it.
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `7596026a` / `7e6042d7` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `d4a5ef0a` / `7cc9304f` |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..7596026a` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..d4a5ef0a` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -1071,12 +1074,197 @@ no merge, `HERMES_RECOVERY_HOLD=1` untouched, no session-database write.
 
 ---
 
+## 21. EXT-RESTORE-002-12 — the release manifest's engine inventory, made single-source
+
+### 21.1 The defect (exposed by the first owner-approved attempt)
+
+The 2026-11-04 production attempt reached `bootstrap` (rc 0) and `stage` (rc 0) and then stopped at
+PLAN with **rc 65**:
+
+```
+REFUSED: staged harness/restore002_session_inventory.py does not match the pinned candidate blob
+```
+
+Nothing was mutated and the gateway was not restarted — the refusal was correct. The staged bytes
+were also correct: the file's candidate blob sha equalled the staged sha. What disagreed was the
+release package's own account of itself. The two lists were not the same list, and they were not
+even different lengths:
+
+| at `65a52a3e` | entries |
+|---|---|
+| launcher `ENGINE_FILES` (what `stage` copied and what `prepare_engine` walked) | `release002_release.sh`, `release002_control.py`, `release002_preflight.py`, `release002_oldgate.py`, **`restore002_session_inventory.py`** |
+| control `engine_paths` literal inside `manifest --write` (what got pinned) | `release002_release.sh`, `release002_control.py`, `release002_preflight.py`, `release002_oldgate.py`, **`hermes-release-002`** |
+
+Both lists held five paths, so a count check would have passed. The manifest pinned the candidate
+*launcher blob* where the launcher staged the *session inventory*, and `prepare_engine()` — which
+demanded a pin for every file it had staged — therefore found no pin for
+`harness/restore002_session_inventory.py` and refused. This was a **release-package defect, not an
+operational NO_GO**: no runtime condition was wrong.
+
+Blast radius: `prepare_engine()` precedes every mutating path, so `plan`, `apply` and `verify` were
+unreachable for any candidate staged since the inventory entered the launcher. CI never exercised
+the real launcher end to end, which is why the first real PLAN found it.
+
+The defect could not be closed in flight. A one-line change to the pin list produces a new candidate
+tree, which requires a new CA review and a new exact-identity owner approval; hand-editing the
+generated manifest would have disabled the very gate that had just refused correctly.
+
+### 21.2 The correction — one inventory, three separately named drifts
+
+Per the authority this is not "add the missing entry". The list now exists once, and every consumer
+reads it:
+
+* **One declaration.** `harness/release002_control.py` declares `ENGINE_FILES` (the five files copied
+  into the engine directory and executed from it) and `PINNED_ENGINE_FILES` (those five plus the
+  candidate launcher blob `harness/hermes-release-002`). `engine_inventory(pinned=...)` is the sole
+  accessor; `build_manifest()` defaults to `PINNED_ENGINE_FILES`, so the manifest writer can no longer
+  pin a different set from the one that is staged. The launcher's private `ENGINE_FILES` array is
+  deleted.
+* **Staging derives from the candidate, not from the launcher.** `stage` extracts the candidate's own
+  `harness/release002_control.py` (`git cat-file blob`), asks *that* file for its inventory
+  (`engine-files --set staged`), and copies exactly those blobs. Paths outside `harness/` and any
+  `..` component are refused, and an inventory of fewer than five entries is refused as implausible.
+  A launcher can therefore no longer stage a set that the candidate's manifest does not pin.
+* **The staged control must prove itself before it is believed.** `engine_audit()` first checks the
+  staged `harness/release002_control.py` against its own pinned blob; a control whose bytes drifted
+  cannot declare an inventory that legitimises its own drift.
+* **Three drifts, three names.** `audit_engine()` compares staged vs pinned vs inventory and fails
+  separately on `no_staged_file_missing_from_manifest`, `no_unexpected_manifest_engine_entry`,
+  `every_inventory_file_staged`, `no_unexpected_staged_file` and `staged_bytes_match_pins`
+  (`__pycache__`/`*.pyc` ignored). `prepare_engine()` runs it before every `plan`/`apply`/`verify` and
+  logs the result, so the success is externally observable rather than inferred.
+* **Publish only what passed.** `stage` writes the manifest beside the real one and `mv`s it into
+  place only after the audit passes, so a manifest describing an unverified engine directory never
+  becomes the staged manifest.
+* **The launcher's integrity requirement stays separate.** `manifest["launcher"]["sha256"]` describes
+  the launcher file actually installed and executed; the candidate launcher *blob* pin in
+  `PINNED_ENGINE_FILES` is provenance, not execution integrity.
+* **Test-only privilege relaxation is fenced.** `require_stage_root()` permits unprivileged staging
+  only with `HERMES_RELEASE_STAGE_UNPRIVILEGED=1` **and** both a non-default `$HERMES_RELEASE_LIB` and
+  a non-default `$HERMES_RELEASE_JOURNAL`; live staging into `/usr/local/lib/hermes-release` stays
+  root-only.
+
+### 21.3 Negative controls and structural regressions (`tests/harness/test_release002_ext12.py`, 18 cases)
+
+| condition | expected | test |
+|---|---|---|
+| inventory is complete and includes the session inventory | `set(ENGINE_FILES) == set(PINNED_ENGINE_FILES) - {launcher}`, 5 entries | `test_the_inventory_names_every_staged_file_including_the_inventory_script` |
+| launcher keeps no copy of the list | `ENGINE_FILES` absent from the launcher source | `test_the_launcher_no_longer_carries_its_own_copy_of_the_list` |
+| CLI and module agree | `engine-files --set staged/pinned` equals the tuples | `test_the_cli_reports_the_same_inventory_the_module_declares` |
+| no production caller may pin its own list | no `engine_paths=` call site; manifest writer defaults to `PINNED_ENGINE_FILES` | `test_no_production_caller_can_supply_its_own_engine_list` |
+| manifest engine map == inventory | six pins, launcher blob included | `test_the_manifest_pins_every_staged_file_and_the_launcher_blob` |
+| **missing pin** (the live defect) | NO_GO `no_staged_file_missing_from_manifest`, rc 2 | `test_a_missing_pin_is_refused` |
+| **additional staged file** | NO_GO `no_unexpected_staged_file` | `test_an_extra_staged_file_is_refused` |
+| **changed file bytes** | NO_GO `staged_bytes_match_pins` | `test_changed_staged_bytes_are_refused` |
+| **stale candidate** (staged for another commit) | NO_GO at `prepare_engine` | `test_plan_refuses_a_stale_candidate` |
+| **wrong candidate tree** | NO_GO `candidate_tree drifted` | `test_plan_refuses_a_wrong_candidate_tree` |
+| **corrupted manifest** | NO_GO `manifest_unreadable`, nothing trusted | `test_a_corrupted_manifest_is_refused` |
+| unexpected manifest entry | NO_GO `no_unexpected_manifest_engine_entry` | `test_an_unexpected_manifest_entry_is_refused` |
+| tampered control claiming its own inventory | refused before the inventory is read | `test_a_tampered_control_is_not_trusted_for_its_own_inventory` |
+| `__pycache__` / `*.pyc` present | ignored, not drift | `test_pycache_is_not_mistaken_for_a_release_file` |
+| inventory entry outside `harness/` | refused, nothing written outside the engine dir | `test_an_inventory_entry_outside_harness_is_refused` |
+| candidate the installation cannot see | NO_GO, not a package defect | `test_plan_refuses_a_candidate_the_installation_cannot_see` |
+| clean stage | audit green, 9/9 gates | `test_a_correct_staging_audits_clean` |
+| **real integration** | bootstrap → stage → manifest verify → PLAN passes `prepare_engine()` and stops only on a genuine operational NO_GO | `test_bootstrap_stage_and_plan_get_past_prepare_engine` |
+
+The integration test is not a mock: it clones the harness into a disposable Git repo, commits a
+candidate, bootstraps a real launcher and manifest into a throwaway library, stages with the real
+`stage` command, verifies the real manifest, and runs the real `plan`. It asserts the run gets past
+`prepare_engine()` (`engine inventory verified`, `manifest verified`, no `REFUSED`) and exits 2 on
+`NO_GO: install identity` — an operational verdict, which is the distinction EXT-12 was raised to
+draw.
+
+### 21.4 Evidence — the real thing, in isolation
+
+Run against the committed candidate, in `/home/hermes/.cache/hermes-release-002-tests/manual-a5aedab5`
+(isolated repo, install, library, journal and `HERMES_HOME`):
+
+```
+bootstrap rc=0
+stage     rc=0    engine staged: .../engine/d4a5ef0a038b (5 files, inventory from the candidate)
+                  engine inventory verified: staged == pinned == candidate inventory, byte-exact
+engine-audit      9/9 gates ok, failed: []
+manifest --verify --phase pre   27/27 gates ok, failed: []
+plan      rc=2    engine inventory verified (staged == pinned == candidate inventory)
+                  manifest verified (launcher, candidate, tree, engine blobs, unit, drop-ins, install identity)
+                  NO_GO: install identity is 65a52a3e/ec029a6e, expected e05128fe/dc05abd0
+```
+
+The PLAN NO_GO is the correct verdict for that fixture: the disposable "installation" is not the
+live one. Under the production identities the same run continues into the quiescence gates.
+
+Complete staged-versus-pinned engine manifest for `d4a5ef0a` (16 hex prefixes; full values in
+`manifest.json`):
+
+| engine file | staged | pinned blob | candidate blob |
+|---|---|---|---|
+| `harness/release002_release.sh` | `3fbaf6bf401a50b5` | `3fbaf6bf401a50b5` | `3fbaf6bf401a50b5` |
+| `harness/release002_control.py` | `09868c70b915bb66` | `09868c70b915bb66` | `09868c70b915bb66` |
+| `harness/release002_preflight.py` | `f97bda141ac254f4` | `f97bda141ac254f4` | `f97bda141ac254f4` |
+| `harness/release002_oldgate.py` | `f1cdd09aee26da33` | `f1cdd09aee26da33` | `f1cdd09aee26da33` |
+| `harness/restore002_session_inventory.py` | `e66b8f8930636cd9` | `e66b8f8930636cd9` | `e66b8f8930636cd9` |
+| `harness/hermes-release-002` (pinned, **not** staged — the installed launcher runs from the library root) | — | `4105d5584c345d2c` | `4105d5584c345d2c` |
+
+Regression totals: **217 passed** — `tests/harness` plus
+`tests/gateway/test_admission_freeze_gate.py` and `tests/gateway/test_stop_budget_adaptation.py`
+(199 at EXT-11 close + 18 new). `bash -n` on both shell entry points and `py_compile` on the four
+Python harness files: clean. Shutdown qualification was not re-run: no shutdown path changed.
+
+Difference from the previously approved candidate `7596026a` / `7e6042d7`, docs excluded — five
+files, all release-package or test, no gateway runtime code:
+
+```
+harness/hermes-release-002             |  90 +++++++--
+harness/release002_control.py          | 135 ++++++++++++-
+tests/harness/test_release002_ext10.py |   3 +-
+tests/harness/test_release002_ext11.py |   3 +-
+tests/harness/test_release002_ext12.py | 340 +++++++++++++++++++++++++++++++++
+```
+
+`test_release002_ext10.py`/`_ext11.py` change only their fixture file list (the launcher now stages
+the candidate's six-file inventory, so those fixtures must contain the sixth file).
+
+### 21.5 Proposed replacement release command
+
+Unchanged in shape — the corrected package is staged and planned exactly like its predecessor, from
+the candidate's own control:
+
+```
+sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 bootstrap
+sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 stage --candidate d4a5ef0a038ba1f4a9796291a445d09713ea5a28
+sudo /usr/local/lib/hermes-release/hermes-release-002 plan --candidate d4a5ef0a038ba1f4a9796291a445d09713ea5a28
+```
+
+`plan` must reach the quiescence gates and report `engine inventory verified (staged == pinned ==
+candidate inventory)` and `manifest verified (…)` before it evaluates any operational condition. A
+`REFUSED:` line is now a package defect; `NO_GO:` is an operational verdict.
+
+### 21.6 Production is unchanged
+
+No production action was taken and none is authorised by this correction. Re-verified after the
+change: installation `/home/hermes/.hermes/hermes-agent` at `e05128fe` / tree `dc05abd0`, clean;
+`hermes-gateway.service` active/running, PID `743641`, `NRestarts=0`, `TimeoutStopUSec=300s`; unit
+sha256 prefix `8b94a1f0` (not regenerated); `90-recovery-hold.conf` and `95-timeout-stop.conf`
+byte-identical to the pinned values; `HERMES_RECOVERY_HOLD=1`; journal
+`/var/lib/hermes-release/restore-002/journal.json` with zero entries; zero `hermes-release-*` units.
+The previously staged launcher (`0450610012…`), `manifest.json` and `engine/7596026ab684/` under
+`/usr/local/lib/hermes-release` are **untouched** and remain the superseded candidate's artifacts
+until a separately authorised restaging.
+
+Biggie LLM Router: PR #17 merged 2026-11-04T07:54:48Z and complete;
+`biggie-llm-router-release.service` PID `1145`, `NRestarts=0`, `/health` 200, `/v1/models` 200 —
+not touched by this work.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `7596026ab684d4b52935388bfc17bcaa948f2387` / tree `7e6042d786509439badf8eba554bd9890f039ab0`,
-   retaining both drop-ins and the recovery hold.
+   `d4a5ef0a038ba1f4a9796291a445d09713ea5a28` / tree `7cc9304fb8d11ae6100d002b4b66ad556ab90a5a`,
+   retaining both drop-ins and the recovery hold. The superseded candidate `7596026a` / `7e6042d7`
+   must not be reused: its release authority was exhausted by the 2026-11-04 `STOPPED_SAFE` attempt
+   and does not transfer.
 2. **Defer 6.6** (retirement of `95-timeout-stop.conf`) until 6.2 has passed and its timing +
    SIGKILL evidence is published.
 3. **No hold release** is requested. Section 7 shows it would resume zero sessions today; the eight
