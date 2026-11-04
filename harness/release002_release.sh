@@ -417,12 +417,26 @@ if [ "$MODE" = verify ]; then
   log "preflight verdict rc=$RC"
   [ "$RC" -eq 0 ] || exit 2
   if [ -f "$MANIFEST" ]; then
+    POST_UNIT_SHA=$("$PY" - "$JOURNAL" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    j = json.load(open(sys.argv[1]))
+except Exception:
+    print(""); raise SystemExit
+for ph in reversed(j.get("phases") or []):
+    if ph.get("phase") == "unit":
+        for tok in (ph.get("note") or "").split():
+            if tok.startswith("sha256="):
+                print(tok.split("=", 1)[1]); raise SystemExit
+print("")
+PYEOF
+)
     set +e
-    manifest_verify "$phase" >"${ARCHIVE:-/tmp}/verify-manifest.json" 2>&1
+    manifest_verify "$phase" "$POST_UNIT_SHA" >"${ARCHIVE:-/tmp}/verify-manifest.json" 2>&1
     MRC=$?
     set -e
     tail -40 "${ARCHIVE:-/tmp}/verify-manifest.json" 2>/dev/null || true
-    log "manifest verification ($phase) rc=$MRC"
+    log "manifest verification ($phase) rc=$MRC (post-unit sha256 ${POST_UNIT_SHA:+present})"
     [ "$MRC" -eq 0 ] || exit 2
   fi
   HOLD=$(systemctl show "$SERVICE" -p Environment --value | grep -c 'HERMES_RECOVERY_HOLD=1' || true)

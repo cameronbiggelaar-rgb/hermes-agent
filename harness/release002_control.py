@@ -234,6 +234,9 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     ``phase="post"`` — after the restart: the install must now be the *candidate* identity, the unit
     must be the regenerated one (``TimeoutStopSec`` at the computed value, and the journaled checksum
     when one is supplied), and the drop-ins must be byte-identical to the staged ones.
+    ``phase="released"`` — the independent post-release check: the same candidate identity set as
+    ``post`` (candidate HEAD/tree, regenerated unit, both retained drop-ins), named with a
+    ``released`` label so it can be driven without re-entering the freeze.
     ``phase="any"``  — structural checks only (used by ``stage``/``status``).
 
     Every check is reported, in order; ``ok`` is true only when all hold AND every gate could be
@@ -244,7 +247,7 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     def gate(name: str, ok: Optional[bool], detail: str = "") -> None:
         gates.append({"gate": name, "ok": bool(ok), "detail": detail})
 
-    if phase not in {"pre", "post", "any"}:
+    if phase not in {"pre", "post", "released", "any"}:
         return {"ok": False, "phase": phase, "gates": [{"gate": "phase", "ok": False,
                 "detail": f"unknown phase {phase!r}"}], "failed": ["phase"]}
 
@@ -283,31 +286,32 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     dirty = ident.get("dirty_files")
     gate("install_clean", dirty == [], f"{len(dirty or [])} changed path(s)")
 
-    if phase in {"pre", "post"}:
+    if phase in {"pre", "post", "released"}:
         want_set = pre if phase == "pre" else post
-        gate(f"install_head_{phase}", ident.get("head") == want_set.get("install_head"),
+        label = phase
+        gate(f"install_head_{label}", ident.get("head") == want_set.get("install_head"),
              f"expected={want_set.get('install_head')} observed={ident.get('head')}")
-        gate(f"install_tree_{phase}", ident.get("tree") == want_set.get("install_tree"),
+        gate(f"install_tree_{label}", ident.get("tree") == want_set.get("install_tree"),
              f"expected={want_set.get('install_tree')} observed={ident.get('tree')}")
         unit_want = (want_set.get("unit") or {})
         unit_path = unit_want.get("path") or (manifest.get("unit") or {}).get("path") \
             or "/etc/systemd/system/hermes-gateway.service"
         if phase == "pre":
-            gate("unit_sha256_pre", sha256_file(unit_path) == unit_want.get("sha256") and bool(unit_want.get("sha256")),
+            gate(f"unit_sha256_{label}", sha256_file(unit_path) == unit_want.get("sha256") and bool(unit_want.get("sha256")),
                  f"pinned={unit_want.get('sha256')} observed={sha256_file(unit_path)}")
         else:
             want_timeout = unit_want.get("timeout_stop_sec")
             observed = unit_timeout_stop_seconds(unit_path)
-            gate("unit_timeout_post", observed is not None and want_timeout is not None
+            gate(f"unit_timeout_{label}", observed is not None and want_timeout is not None
                  and abs(float(observed) - float(want_timeout)) < 1e-6,
                  f"expected TimeoutStopSec={want_timeout} observed={observed}")
             if expected_post_unit_sha256:
-                gate("unit_sha256_post", sha256_file(unit_path) == expected_post_unit_sha256,
+                gate(f"unit_sha256_{label}", sha256_file(unit_path) == expected_post_unit_sha256,
                      f"journal={expected_post_unit_sha256} observed={sha256_file(unit_path)}")
         for name, want in (want_set.get("dropins") or {}).items():
             path = Path(unit_path).parent / f"{Path(unit_path).name}.d" / name
             got = sha256_file(path)
-            gate(f"dropin_{phase}:{name}", bool(want) and got == want, f"pinned={want} observed={got}")
+            gate(f"dropin_{label}:{name}", bool(want) and got == want, f"pinned={want} observed={got}")
 
     sup = manifest.get("supervisor") or {}
     plan = envelope_plan()
@@ -693,7 +697,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     m.add_argument("--candidate", default="")
     m.add_argument("--expected-install-head", default="")
     m.add_argument("--unit", default="/etc/systemd/system/hermes-gateway.service")
-    m.add_argument("--phase", default="pre", choices=["pre", "post", "any"],
+    m.add_argument("--phase", default="pre", choices=["pre", "post", "released", "any"],
                    help="which pinned identity set to verify (EXT-07)")
     m.add_argument("--expected-post-unit-sha256", dest="expected_post_unit_sha256", default=None,
                    help="journaled checksum of the regenerated unit, when the caller has it")

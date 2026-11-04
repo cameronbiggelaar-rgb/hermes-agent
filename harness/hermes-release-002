@@ -322,7 +322,7 @@ cmd_plan() {
   prepare_engine
   local rc=0 report
   report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
-  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" >"$report" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log "manifest verification FAILED — printing gates"
@@ -335,7 +335,7 @@ cmd_plan() {
 
 cmd_verify() {
   require_root; prepare_engine
-  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase released --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" >/dev/null || { log "manifest verification FAILED"; exit 2; }
   "$ENGINE_DIR/harness/release002_release.sh" --verify-only --candidate "$CANDIDATE"
 }
@@ -345,7 +345,7 @@ cmd_apply() {
   local approval=${HERMES_RELEASE_APPROVAL:-}
   [ "$approval" = "$CANDIDATE" ] || die "set HERMES_RELEASE_APPROVAL=$CANDIDATE to authorise this exact candidate"
   local report; report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
-  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" >"$report" \
     || { log "manifest verification FAILED — refusing to stage the supervisor"; cat "$report"; exit 2; }
 
