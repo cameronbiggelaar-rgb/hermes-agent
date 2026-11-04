@@ -1,12 +1,13 @@
-# HERMES-RESTORE-002 — External CA review package (correction 7)
+# HERMES-RESTORE-002 — External CA review package (correction 8)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
 prerequisites the External CA raised against PR #9 (EXT-01/02), the three release-orchestration
 findings raised against the corrected candidate (EXT-03 launcher integrity, EXT-04 cutover
 admission control, EXT-05 supervisor lifecycle, EXT-06..11 phase and checksum contracts), the
-release-manifest completeness defect the first owner-approved attempt exposed (EXT-12), and the
-single bounded release procedure.
+release-manifest completeness defect the first owner-approved attempt exposed (EXT-12), the
+baseline-versus-candidate contradiction the second attempt exposed (EXT-13), and the single bounded
+release procedure.
 
 Nothing in this package has been deployed, merged, restarted or activated. The live service is
 exactly as RESTORE-001 left it.
@@ -16,7 +17,8 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling, incl. EXT-12) | **`d4a5ef0a038ba1f4a9796291a445d09713ea5a28`**, tree **`7cc9304fb8d11ae6100d002b4b66ad556ab90a5a`** |
+| **release candidate** (code + tests + tooling, incl. EXT-13) | **`48a930361347ad2f947c0af9b861d92b03338599`**, tree **`36a27c4661ab83994ab6b7fd63a71788152d7fe1`** |
+| previous candidate (EXT-12, superseded by EXT-13 — authority exhausted, does not transfer) | `d4a5ef0a038ba1f4a9796291a445d09713ea5a28`, tree `7cc9304fb8d11ae6100d002b4b66ad556ab90a5a` |
 | previous candidate (EXT-06..11, superseded by EXT-12 — its release authority is exhausted and does not transfer) | `7596026ab684d4b52935388bfc17bcaa948f2387`, tree `7e6042d786509439badf8eba554bd9890f039ab0` |
 | previous candidate (EXT-06..10, superseded by EXT-11) | `a4f08d6315072e6057984ae74dbf289736f9d110`, tree `27f8916b1eafbad3328e09139c21c7654645fe99` |
 | previous candidate (EXT-06..09, superseded by EXT-10) | `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`, tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b` |
@@ -25,10 +27,10 @@ exactly as RESTORE-001 left it.
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `d4a5ef0a` / `7cc9304f` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `48a93036` / `36a27c46` |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..d4a5ef0a` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..48a93036` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -1233,6 +1235,7 @@ the candidate's own control:
 sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 bootstrap
 sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 stage --candidate d4a5ef0a038ba1f4a9796291a445d09713ea5a28
 sudo /usr/local/lib/hermes-release/hermes-release-002 plan --candidate d4a5ef0a038ba1f4a9796291a445d09713ea5a28
+# superseded by §22: that candidate's authority is exhausted; use 48a93036 / 36a27c46
 ```
 
 `plan` must reach the quiescence gates and report `engine inventory verified (staged == pinned ==
@@ -1257,11 +1260,271 @@ not touched by this work.
 
 ---
 
+## 22. EXT-RESTORE-002-13 — the baseline/candidate boundary, corrected
+
+### 22.1 What the second production attempt found
+
+The 2026-11-05 attempt (`bootstrap --force` rc 0, `stage --candidate d4a5ef0a` rc 0, engine audit 9/9)
+stopped at `plan` rc 2 with **no mutation and no restart**. Two gates failed *by construction*, not
+because production was unhealthy:
+
+| # | gate | what it said | why |
+|---|---|---|---|
+| A | `session_inventory` | `unevaluable` → critical fail | `harness/release002_preflight.py` did `import gateway.session_resume_plan` from the **installed** gateway. That module is candidate-only: absent at baseline `e05128fe`, added in `5d02e1da35`. |
+| B | `worktree_matches_candidate:*` (6 gates) | `FAIL` | `harness/release002_release.sh` passed `--repo "$INSTALL"` — the **baseline** worktree — while the comparison target is the **candidate's** blobs. Pre-merge the two can never agree. |
+
+Both are the same modelling error: every earlier fixture, and every earlier E2E test, ran in a world
+where `INSTALL == REPO == CANDIDATE`. EXT-13 removes that assumption from the code, not from the
+gates. The manifest's 28 checks are unchanged in number and strictness; only **which repository each
+check reads** became explicit.
+
+Adversarial review of the full release path found two further defects of the same family, which the
+report did not name (22.5, 22.6).
+
+### 22.2 Root cause
+
+The release package treated one directory as three different things at once — the tree that is
+installed, the tree that holds the candidate commit, and the tree that will execute the release.
+Before deployment the first two are different by definition. Any check written against
+"the repository" silently bound to whichever of the three happened to be cheapest to reference.
+
+### 22.3 EXT-13A — pinned-blob session inventory (no installed-gateway import)
+
+New in `harness/release002_control.py`:
+
+| function | contract |
+|---|---|
+| `blob_sha256(repo, commit, path)` | blob id at `commit:path`, or `None`; never reads the worktree |
+| `blob_bytes(repo, commit, path)` | exact bytes via `git cat-file blob`, or `None` |
+| `load_pinned_module(repo, commit, path, *, name=…)` | compiles those bytes into a detached `ModuleType`; registers it in `sys.modules` under the content-addressed key `f"{name}_{sha256[:16]}"` **only while `exec` runs**, then removes it |
+
+The planner is then loaded from `candidate_commit:gateway/session_resume_plan.py` — deterministically,
+identically **before and after** deployment, with no `sys.path` mutation, no ambient `PYTHONPATH`, no
+virtualenv resolution and no change to the installed gateway. `release002_preflight.session_state()`
+now reports `planner=pinned-candidate-blob:<sha12>` in the gate detail, so the evidence names the
+exact bytes that classified the sessions. The temporary `sys.modules` registration is required
+because the planner declares `@dataclass` types and `dataclasses` resolves the defining module by
+name while creating the class; the key is content-addressed and removed afterwards, so the module is
+never importable by path and a reload is deterministic.
+
+`harness/restore002_session_inventory.py` keeps every protection and gains explicit inputs:
+
+- `--candidate <40-hex>` is **mandatory** (opt out only with the loudly named `--allow-unpinned-planner`);
+- `--source-repo` names the repository that holds that commit;
+- `--store` / `--index` allow qualification against a disposable session store — still opened
+  `mode=ro` with `PRAGMA query_only=1`, so the production database is never a write target;
+- the payload reports `planner_source` and `planner{path, commit, blob, sha256, repo}`.
+
+Fail-closed behaviour, measured (22.8): a baseline that lacks the module → `session_planner` fails
+with `pinned planner unavailable: … is absent at e05128fe…`; a missing store → `session_store` fails
+with `unable to open database file`; a malformed store → `session_store` fails with `file is not a
+database`. All three exit 2 and produce **no** partial classification.
+
+### 22.4 EXT-13B — three identities, one check each
+
+`verify_manifest()` now takes them separately:
+
+`verify_manifest(manifest, *, repo, install, launcher, phase="pre", expected_post_unit_sha256=None, source=None, engine_dir=None)`
+
+| identity | what it is | which arguments carry it | when it is checked |
+|---|---|---|---|
+| installed baseline | the tree systemd actually runs | `install`, `launcher` (installed at `$LIB`) | `pre`: exact HEAD/tree, clean worktree (0 dirty), unit + drop-in bytes, launcher sha256 |
+| candidate | commit/tree and pinned source blobs | `repo`, `source` | always, from git objects: `candidate_commit`, `candidate_tree`, `blob:*` (6), `candidate_available` |
+| staged engine | the exact bytes approved for execution | `engine_dir` (engine **root**), `manifest` | always: `staged_file_bytes:*` vs pinned candidate blobs, `staged_engine_dir_supplied/present`, engine audit |
+
+`worktree_matches_candidate:*` is now a `pre`-only comparison of the **baseline** worktree against
+the **manifest**, and `LAUNCHER_REL` is skipped there and in `staged_file_bytes` — the launcher is
+installed into `$LIB`, never into the install worktree, and its identity is proved by
+`launcher_sha256` / `launcher_path` instead. No check was removed: the 6 worktree gates, the 6 blob
+gates, the 2 engine-dir gates, the engine audit, the unit/drop-in checks and the recovery-hold checks
+all still run; a wrong tree now fails the gate that owns it.
+
+### 22.5 Defect C — the engine verified the wrong directory level
+
+`release002_release.sh` computed `ENGINE_DIR=$(cd "$(dirname "$0")" && pwd)` — i.e. `…/harness` —
+while manifest engine keys are `harness/<file>`. Passing that as `--engine-dir` made every lookup
+`harness/harness/<file>`. Fixed by computing `ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)` and
+passing `--engine-dir "$ENGINE_ROOT"` at both call sites. Negative control: a staged file modified in
+place is still refused (22.8), so the level was corrected without loosening the check.
+
+### 22.6 Defect D — the engine could verify a manifest the launcher never pinned
+
+`prepare_engine()` in `harness/hermes-release-002` exported the staged engine path but not the
+manifest or the launcher, so the engine fell back to its compiled-in defaults. Both are now exported
+(`HERMES_RELEASE_MANIFEST="$MANIFEST"`, `HERMES_RELEASE_LAUNCHER="$SELF"`) and the launcher's own
+`plan` / `apply` pre-verification passes `--source "$REPO" --engine-dir "$ENGINE_ROOT"`. Negative
+control: a manifest whose unit pin is stale is rejected by `unit_sha256_pre` (22.8).
+
+### 22.7 EXT-13C — PLAN is conjunctive, and says which way it failed
+
+`harness/release002_release.sh` evaluates preflight **and** manifest verification and then:
+
+| preflight | manifest | verdict | exit |
+|---|---|---|---|
+| 0 | 0 | `GO` | 0 |
+| 0 | 2 (failed) | `NO_GO` | 2 |
+| 2 (failed) | 0 | `NO_GO` | 2 |
+| any | 3 (unevaluable) | `UNEVALUABLE` | 3 |
+
+A manifest that is **absent** is `UNEVALUABLE` (warn + `return 3`), not a failed gate: nothing was
+compared, so nothing may be reported as evidence of failure. The tests assert both named
+combinations in the brief — preflight PASS + manifest FAIL → `NO_GO`; manifest PASS + preflight FAIL
+→ `NO_GO` — plus `GO` only when both are 0, and `GO` is asserted **absent** in every failing arm.
+The arm that proves it is `test_engine_plan_never_reports_go_when_the_manifest_fails`: a real manifest
+is written, its `pre_release.unit.sha256` is poisoned to zeros, and with preflight genuinely passing
+(`preflight verdict GO` present in the output) the run still exits 2 and prints
+`manifest rc=2`.
+
+### 22.8 Real-baseline divergence qualification
+
+Disposable workspace, hermetic env (`PATH`, `HOME` only), two independent clones of the same
+repository:
+
+| role | commit | tree | provenance |
+|---|---|---|---|
+| installed baseline | `e05128febbc559469a5fb835a9235a543dfdfa64` | `dc05abd074c834569cf19ca89a6446d74be5c41d` | real Git object, clean worktree |
+| source / candidate | `48a930361347ad2f947c0af9b861d92b03338599` | `36a27c4661ab83994ab6b7fd63a71788152d7fe1` | real Git object |
+| `gateway/session_resume_plan.py` at baseline | **absent** (`git cat-file -e` rc 1) | — | proves the divergence is real |
+| `gateway/session_resume_plan.py` at candidate | blob `9405ed50a67c…`, sha256 `c80b2334bdb0…` | — | the pinned planner actually used |
+
+Full launcher path, `bootstrap → stage → engine audit → manifest pre-verify → plan`:
+
+```
+BOOTSTRAP        rc=0
+STAGE            rc=0   candidate 48a93036… tree 36a27c46… available to <ws>/install
+                         launcher sha256: e07dadc9c156242b8cdaa35fb5ed2421cc0ff7ceb88f6b265629168121f9c017
+ENGINE_AUDIT     rc=0   staged == pinned == candidate, 6/6 files
+MANIFEST PRE     rc=0   ok=true  28/28 gates, failed=[]
+PLAN             rc=2   DRY RUN RESULT: NO_GO — preflight rc=2, manifest rc=0
+                         (both must pass; nothing was changed)
+                         no REFUSED line anywhere in the output
+```
+
+Every structural gate passed: `candidate_commit`, `candidate_tree`, `candidate_available`,
+`candidate_tree_matches_install`, the 6 `blob:*` gates, `staged_engine_dir_supplied`,
+`staged_engine_dir_present`, the 6 `staged_file_bytes:*` gates, `install_head_pre`, `install_tree_pre`,
+`launcher_sha256`, `launcher_path`, `unit_sha256_pre`, both drop-in pins, `recovery_hold`,
+`supervisor_*`, `manifest_schema`.
+
+The only remaining refusal is the four modelled operational conditions, in the live host's own words:
+
+| gate | detail | classification |
+|---|---|---|
+| `no_active_turns` | `gateway_state.active_agents=3` | operational — three turns are live |
+| `recent_session_activity` | 3 sessions active within 120 s | operational — quiet window not met |
+| `old_runtime_coverage` | `verdict=unevaluable producers=12` | pre-existing fail-closed gate (EXT-06..09), identical before EXT-13 |
+| `old_runtime_dynamic_gates` | `interpreter=FAIL` | pre-existing fail-closed gate; the clone has no installed runtime to enumerate |
+
+None of the four is a baseline/candidate identity contradiction: they are the operational quiescence
+conditions the release is *supposed* to refuse on, plus two old-runtime gates that fail closed in both
+the clone and the live host and that EXT-13 neither touches nor relaxes.
+
+### 22.9 Negative controls (all fail closed, zero mutation)
+
+| control | expected | measured |
+|---|---|---|
+| wrong baseline identity (`--install` = candidate clone) | gate-level fail | rc 2, `install_head_pre`, `install_tree_pre` failed |
+| wrong source repository (unrelated git repo) | gate-level fail | rc 2, 9 gates failed (`candidate_available`, `candidate_tree`, `candidate_tree_matches_install`, 6 `blob:*`) |
+| modified staged file (`harness/release002_preflight.py` truncated in place) | refuse before any gate | **rc 65 `REFUSED`**, no manifest evaluation |
+| stale unit pin (manifest unit sha256 → zeros) | manifest fail, preflight still passes | rc 2, `unit_sha256_pre` failed |
+| manifest absent | unevaluable, never GO | rc 3 `DRY RUN RESULT: UNEVALUABLE — a required gate could not be evaluated (preflight rc=2, manifest rc=3)` |
+| candidate-only module absent at the pinned commit | inventory fails closed | rc 2, `session_planner`, `pinned planner unavailable: gateway/session_resume_plan.py is absent at e05128fe…` |
+| missing session store | fail closed | rc 2, `session_store`, `unable to open database file` |
+| malformed session store | fail closed | rc 2, `session_store`, `file is not a database` |
+| pre vs post inventory, same store | identical payload | `planner_source=pinned-candidate-blob`, blob `9405ed50…`, open=2, counts `{completed:1, active:1, resumable:0, obsolete:1, needs_human:0}` at **both** identities |
+
+The last row is the EXT-13A compatibility proof without mutation: the pre-deployment inventory reads
+the pinned planner from the **source** repository, the post-deployment inventory reads the identical
+pinned planner from the **deployed** clone at the same commit, and the classification is byte-for-byte
+the same because the code bytes are pinned, not the tree they live in.
+
+Against the real session store (read-only, `mode=ro` + `PRAGMA query_only=1`) the same gate now
+evaluates at the true baseline: `session_inventory ok=true detail=open=499 counts={'completed': 2215,
+'active': 6, 'resumable': 0, 'obsolete': 492, 'needs_human': 1} empty=8
+planner=pinned-candidate-blob:c80b2334bdb0`.
+
+### 22.10 Regression totals
+
+`env -u PYTHONPATH /usr/bin/python3 -m pytest tests/harness -q` → **218 passed, 0 failed**.
+
+| file | tests |
+|---|---|
+| `test_release002_control.py` | 60 |
+| `test_release002_ext11.py` | 42 |
+| `test_release002_release_paths.py` | 40 |
+| `test_release002_ext13.py` (new) | 29 |
+| `test_release002_ext12.py` | 18 |
+| `test_release002_launcher.py` | 18 |
+| `test_release002_ext10.py` | 11 |
+
+The committed EXT-12 tree (`d4a5ef0a`) collects **187**, not the 217 quoted in correction 7 — that
+figure was a miscount and this correction supersedes it. EXT-13 therefore adds 31 tests net
+(29 new + 2 in the existing files) on top of a verified 187.
+
+### 22.11 Source / installation / staged-engine identity matrix
+
+| path | source of truth | pre-deploy value | post-deploy value |
+|---|---|---|---|
+| `harness/hermes-release-002` | candidate blob `1d62f67afe18…` → installed `$LIB` sha256 `e07dadc9c156…` | launcher gate, not worktree gate | same sha256 |
+| `harness/release002_control.py` | blob `09881180d033…` / sha256 `f0850a69daf9…` | staged bytes == pinned | installed bytes == pinned |
+| `harness/release002_release.sh` | blob `f146fa13fb5d…` / sha256 `a350e822cecc…` | ditto | ditto |
+| `harness/release002_preflight.py` | blob `a2d8169d4121…` / sha256 `0c3715a6850…` | ditto | ditto |
+| `harness/release002_oldgate.py` | blob `4717f36b6586…` / sha256 `f1cdd09aee26…` | ditto | ditto |
+| `harness/restore002_session_inventory.py` | blob `243b0f61a38a…` / sha256 `c1045f134726…` | ditto | ditto |
+| `gateway/session_resume_plan.py` | blob `9405ed50a67c…` / sha256 `c80b2334bdb0…` | **absent** in install, read from source repo | present in install, same blob |
+| unit `hermes-gateway.service` | `/etc/systemd/system`, sha256 `8b94a1f0…` | not regenerated | regenerated + `expected_post_unit_sha256` |
+
+### 22.12 Before/after non-mutation evidence
+
+Measured across the whole qualification run (bootstrap, stage, audit, manifest verify, plan, eight
+controls):
+
+```
+before = {unit: 8b94a1f0…, install: e05128fe…, journal_exists: false, engine: f0850a69…}
+after  = {unit: 8b94a1f0…, install: e05128fe…, journal_exists: false, engine: f0850a69…}
+identical = true      unit_unchanged = true      manifest_restored = true
+```
+
+The production installation's HEAD never moved off `e05128fe`, no journal file was created, the unit
+file was not rewritten, and the poison/restore arms left the manifest byte-identical to its pre-test
+copy. Nothing was restarted, and no session row was written (`mode=ro` throughout).
+
+### 22.13 Remaining operational risks (unchanged by this correction)
+
+1. **Quiescence is still unmet on the live host** — `active_agents=3` and three sessions inside the
+   120 s window. No release can proceed until those clear naturally; EXT-13 neither shortens the
+   window nor suppresses the gate.
+2. **The two old-runtime gates fail closed and are not addressed here.** They require their own
+   authority; they are not baseline/candidate defects and they are not bypassable by this change.
+3. **Release authority is exhausted.** `d4a5ef0a` must not be reused and this candidate has no
+   approval attached: EXT-13 carries code-correction authority only.
+4. **The host still holds the superseded candidate's staged artifacts** — launcher `4105d558…`,
+   `manifest.json` `3d2f60cd…`, `engine/d4a5ef0a038b/`. A future attempt must re-`bootstrap` and
+   re-`stage` from `48a93036`, not reuse them.
+5. **`git cat-file` is now on the release path.** It is a build-time dependency of both `pre` and
+   `post` verification; a repository without the candidate commit (e.g. a pruned clone) fails closed
+   at `candidate_available`, which is the intended behaviour but is a new operational precondition.
+
+### 22.14 Proposed replacement release command (not authorised)
+
+```
+sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 bootstrap --force
+sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 stage --candidate 48a930361347ad2f947c0af9b861d92b03338599
+sudo /usr/local/lib/hermes-release/hermes-release-002 plan --candidate 48a930361347ad2f947c0af9b861d92b03338599
+```
+
+`plan` must print `engine inventory verified`, `manifest verified` and no `REFUSED:` line before it
+evaluates quiescence. Any `REFUSED:` is a package defect; `NO_GO:` is an operational verdict;
+`UNEVALUABLE` means a required gate could not be evaluated and is never a licence to proceed.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `d4a5ef0a038ba1f4a9796291a445d09713ea5a28` / tree `7cc9304fb8d11ae6100d002b4b66ad556ab90a5a`,
+   `48a930361347ad2f947c0af9b861d92b03338599` / tree `36a27c4661ab83994ab6b7fd63a71788152d7fe1`
+   (EXT-13; no release is requested until the External CA has reviewed §22),
    retaining both drop-ins and the recovery hold. The superseded candidate `7596026a` / `7e6042d7`
    must not be reused: its release authority was exhausted by the 2026-11-04 `STOPPED_SAFE` attempt
    and does not transfer.
