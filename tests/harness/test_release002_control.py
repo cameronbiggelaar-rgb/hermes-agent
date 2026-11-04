@@ -118,7 +118,7 @@ def verify(stage_dict, **overrides):
             node = node[part]
         node[parts[-1]] = value
     return ctrl.verify_manifest(manifest, repo=stage_dict["repo"], install=stage_dict["install"],
-                                launcher=stage_dict["launcher"])
+                                launcher=stage_dict["launcher"], phase=stage_dict.get("phase", "pre"))
 
 
 def test_manifest_roundtrip_is_green(stage):
@@ -134,8 +134,8 @@ def test_every_manifest_gate_is_evaluated_and_named(stage):
     names = [g["gate"] for g in result["gates"]]
     assert all(isinstance(g["ok"], bool) for g in result["gates"])
     for required in ("schema", "candidate_commit_shape", "candidate_available", "candidate_tree",
-                     "launcher_sha256", "install_clean", "install_head_expected", "unit_sha256",
-                     "supervisor_envelope"):
+                     "launcher_sha256", "install_clean", "install_head_pre", "install_tree_pre",
+                     "unit_sha256_pre", "supervisor_envelope"):
         assert required in names
     assert result["ok"] == (result["failed"] == [])
 
@@ -163,12 +163,12 @@ def test_launcher_at_a_different_path_fails_closed(stage):
 def test_missing_dropin_fails_closed(stage):
     stage["dropins"]["95-timeout-stop.conf"].unlink()
     failed = verify(stage)["failed"]
-    assert "dropin:95-timeout-stop.conf" in failed
+    assert "dropin_pre:95-timeout-stop.conf" in failed
 
 
 def test_modified_unit_fails_closed(stage):
     stage["unit"].write_text("[Service]\nTimeoutStopSec=210s\n", encoding="utf-8")
-    assert "unit_sha256" in verify(stage)["failed"]
+    assert "unit_sha256_pre" in verify(stage)["failed"]
 
 
 def test_candidate_absent_from_the_installation_fails_closed(stage):
@@ -184,7 +184,7 @@ def test_candidate_absent_from_the_installation_fails_closed(stage):
 def test_install_identity_drift_fails_closed(stage):
     git(stage["install"], "reset", "--hard", "-q", stage["candidate"])
     failed = verify(stage)["failed"]
-    assert "install_head_expected" in failed and "install_tree_expected" in failed
+    assert "install_head_pre" in failed and "install_tree_pre" in failed
 
 
 def test_dirty_install_fails_closed(stage):
@@ -198,7 +198,7 @@ def test_short_candidate_sha_fails_closed(stage):
 
 
 def test_schema_bump_fails_closed(stage):
-    assert "schema" in verify(stage, schema=ctrl.SCHEMA + 1)["failed"]
+    assert "schema" in verify(stage, schema=ctrl.MANIFEST_SCHEMA + 1)["failed"]
 
 
 def test_supervisor_envelope_shortfall_fails_closed(stage):

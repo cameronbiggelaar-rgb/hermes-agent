@@ -13,6 +13,7 @@
 # ones, the candidate is already available to the installation, the installation is clean and on
 # the expected identity, and no other release supervisor is alive.
 #
+#   hermes-release-002 bootstrap         install *this* launcher under $LIB, verified (root)
 #   hermes-release-002 status            read-only: pins, service, freeze markers, journal
 #   hermes-release-002 stage  --candidate SHA   extract + pin engine, write manifest (root)
 #   hermes-release-002 plan   --candidate SHA   dry run: manifest + preflight, no mutation
@@ -35,8 +36,9 @@ SERVICE=hermes-gateway.service
 JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
 PY3=/usr/bin/python3.13
 ENGINE_FILES=(harness/release002_release.sh harness/release002_control.py
-              harness/release002_preflight.py harness/restore002_session_inventory.py)
-CMD=""; CANDIDATE=""; DETACH=0
+              harness/release002_preflight.py harness/release002_oldgate.py
+              harness/restore002_session_inventory.py)
+CMD=""; CANDIDATE=""; DETACH=0; DRY_RUN=0; FORCE=0; SOURCE_COMMIT=""
 
 log()  { printf '[hermes-release-002] %s\n' "$*"; }
 die()  { printf '[hermes-release-002] REFUSED: %s\n' "$*" >&2; exit 65; }
@@ -49,11 +51,14 @@ ctrl() {
   env -u PYTHONPATH "$PY3" "$py/harness/release002_control.py" "$@"
 }
 
-usage() { sed -n '2,32p' "$SELF"; }
+usage() { sed -n '2,36p' "$SELF"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    status|stage|plan|verify|apply|recover) CMD=$1; shift ;;
+    bootstrap|status|stage|plan|verify|apply|recover) CMD=$1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --source-commit) SOURCE_COMMIT=$2; shift 2 ;;
     --candidate) CANDIDATE=$2; shift 2 ;;
     --candidate=*) CANDIDATE=${1#*=}; shift ;;
     --repo) REPO=$2; shift 2 ;;
@@ -127,6 +132,85 @@ require_candidate() {
 engine_dir_for() { echo "$LIB/engine/${1:0:12}"; }
 
 # ---------------------------------------------------------------------------- commands
+cmd_bootstrap() { # deterministic, verified installation of this launcher (EXT-09)
+  local src sha src_repo src_commit blob_sha dest had_sha
+  src=$SELF
+  if [ "$(id -u)" -ne 0 ]; then
+    # A non-root bootstrap is only ever allowed against a throwaway library, never the live one.
+    if [ "${HERMES_RELEASE_BOOTSTRAP_UNPRIVILEGED:-0}" != "1" ] || [ "$LIB" = "/usr/local/lib/hermes-release" ]; then
+      die "bootstrap needs root (or HERMES_RELEASE_BOOTSTRAP_UNPRIVILEGED=1 with a non-default \$HERMES_RELEASE_LIB)"
+    fi
+    log "unprivileged bootstrap into $LIB (test fixture only)"
+  fi
+  case "$src" in
+    "$LIB"/hermes-release-002) die "already running from the install path; run bootstrap from the repository copy" ;;
+  esac
+  src_repo=$(git -C "$(dirname "$src")" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$src_repo" ] || die "this launcher ($src) is not inside a git worktree; bootstrap needs a committed launcher"
+  src_commit=${SOURCE_COMMIT:-$(git -C "$src_repo" rev-parse HEAD)}
+  [ ${#src_commit} -eq 40 ] || die "source commit must be a full 40-character SHA"
+  src_rel=${src#"$src_repo"/}
+  case "$src_rel" in
+    harness/hermes-release-002) : ;;
+    *) die "bootstrap must run from harness/hermes-release-002 inside the release repository (this is $src_rel)" ;;
+  esac
+  # The bytes being installed must be a committed blob, not a local edit: otherwise the "verified
+  # bootstrap" would pin bytes that exist nowhere in history.
+  blob_sha=$(git -C "$src_repo" show "$src_commit:$src_rel" 2>/dev/null | sha256sum | cut -d' ' -f1)
+  [ -n "$blob_sha" ] || die "cannot read $src_rel at $src_commit"
+  sha=$(sha256sum "$src" | cut -d' ' -f1)
+  [ "$sha" = "$blob_sha" ] || die "working launcher ($sha) differs from $src_commit:$src_rel ($blob_sha); commit it first"
+  dest=$LIB/hermes-release-002
+  had_sha=""
+  if [ -e "$dest" ]; then
+    had_sha=$(sha256sum "$dest" | cut -d' ' -f1)
+    if [ "$had_sha" = "$sha" ]; then
+      # Idempotent: identical bytes are left untouched (no rewrite, no mtime churn). A missing
+      # manifest is still (re)written, because a launcher without its pinned manifest is unusable.
+      log "already bootstrapped: $dest is byte-identical ($sha)"
+      if [ -f "$MANIFEST" ]; then
+        log "manifest present: $MANIFEST"
+      else
+        env -u PYTHONPATH "$PY3" "$(git -C "$(dirname "$src")" rev-parse --show-toplevel)/harness/release002_control.py" \
+          manifest --bootstrap --path "$MANIFEST" --launcher "$dest" --source-commit "$src_commit" >/dev/null \
+          || die "could not write the bootstrap manifest"
+        log "wrote missing manifest: $MANIFEST"
+      fi
+      return 0
+    elif [ "$FORCE" -ne 1 ]; then
+      die "a different launcher is installed at $dest ($had_sha); re-run with --force to replace it"
+    fi
+  fi
+  log "bootstrap plan:"
+  log "  source     $src"
+  log "  commit     $src_commit (blob matches working tree)"
+  log "  sha256     $sha"
+  log "  install to $dest"
+  log "  manifest   $MANIFEST"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "dry run: nothing written"
+    return 0
+  fi
+  mkdir -p "$LIB/engine"
+  if [ -n "$had_sha" ] && [ "$had_sha" != "$sha" ]; then
+    cp -p "$dest" "$dest.prev-${had_sha:0:8}"
+    log "previous launcher kept at $dest.prev-${had_sha:0:8}"
+  fi
+  install -m 0755 "$src" "$dest.new"
+  [ "$(sha256sum "$dest.new" | cut -d' ' -f1)" = "$sha" ] || { rm -f "$dest.new"; die "copied launcher does not match the source checksum"; }
+  mv -f "$dest.new" "$dest"   # atomic replace: no partial launcher is ever visible
+  [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ] || die "installed launcher does not match the source checksum"
+  env -u PYTHONPATH "$PY3" "$src_repo/harness/release002_control.py" manifest --bootstrap \
+    --path "$MANIFEST" --launcher "$dest" --source-commit "$src_commit" >/dev/null \
+    || die "could not write the bootstrap manifest"
+  local pinned; pinned=$(manifest_field launcher.sha256) || die "manifest unreadable after bootstrap"
+  [ "$pinned" = "$sha" ] || die "manifest pins $pinned but $dest is $sha"
+  log "bootstrapped: $dest"
+  log "launcher sha256: $sha"
+  log "manifest: $MANIFEST"
+  log "next: $(basename "$dest") stage --candidate <sha>   then   plan --candidate <sha>"
+}
+
 cmd_status() {
   log "launcher: $SELF"
   if [ -f "$MANIFEST" ]; then
@@ -315,6 +399,7 @@ cmd_recover() {
 }
 
 case "$CMD" in
+  bootstrap) cmd_bootstrap ;;
   status)  cmd_status ;;
   stage)   cmd_stage ;;
   plan)    cmd_plan ;;

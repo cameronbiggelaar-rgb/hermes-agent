@@ -1,6 +1,20 @@
-"""Read-only preflight for the RESTORE-002 bounded release (owner-gated; mutates nothing).
+"""Phase-aware, read-only preflight for the RESTORE-002 bounded release (mutates nothing).
 
-    env -u PYTHONPATH /usr/bin/python3.13 harness/release002_preflight.py [--json PATH]
+    env -u PYTHONPATH /usr/bin/python3.13 harness/release002_preflight.py --phase pre  ...
+    env -u PYTHONPATH /usr/bin/python3.13 harness/release002_preflight.py --phase post ...
+
+Two verifiers, not one relaxed one (EXT-06). The release freezes admission before it stops the
+service, so the post-deployment check runs while ``gateway_state=draining``. Requiring ``running``
+there would make a correct release unverifiable; dropping the requirement would let a post-release
+verification pass with the service down. So each phase asserts its own invariant:
+
+  ``--phase pre``  install is the *pre-release* identity, the gateway is ``running`` and not
+                   draining, no turn is in flight, the deployed runtime's own drain/ESTOP gates
+                   cover every producer, and the candidate is present and descends from the install.
+  ``--phase post`` install is the *candidate* identity, the service is active under the new code,
+                   the freeze this run engaged is still engaged (``gateway_state=draining``), the
+                   regenerated unit's effective ``TimeoutStopSec`` is the computed 300 s, and no
+                   SIGKILL occurred.
 
 Exit codes: 0 = every gate green (a release may be proposed), 2 = at least one gate failed,
 3 = a gate could not be evaluated (treated as failed — fail closed).
@@ -21,15 +35,23 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))
 
-INSTALL = "/home/hermes/.hermes/hermes-agent"
+from release002_oldgate import oldgate_report  # noqa: E402  (probe of the deployed runtime)
+
+# The engine exports HERMES_RELEASE_INSTALL / HERMES_RELEASE_HOME; the defaults are the live host.
+HERMES_HOME = os.environ.get("HERMES_RELEASE_HOME") or "/home/hermes/.hermes"
+INSTALL = os.environ.get("HERMES_RELEASE_INSTALL") or f"{HERMES_HOME}/hermes-agent"
 SERVICE = "hermes-gateway.service"
 UNIT_DIR = "/etc/systemd/system"
 HOLD_DROPIN = f"{UNIT_DIR}/{SERVICE}.d/90-recovery-hold.conf"
 TIMEOUT_DROPIN = f"{UNIT_DIR}/{SERVICE}.d/95-timeout-stop.conf"
-DB = "/home/hermes/.hermes/state.db"
-INDEX = "/home/hermes/.hermes/sessions/sessions.json"
+DB = f"{HERMES_HOME}/state.db"
+INDEX = f"{HERMES_HOME}/sessions/sessions.json"
+GW_STATE = f"{HERMES_HOME}/gateway_state.json"
+DRAIN_MARKER = f"{HERMES_HOME}/.drain_request.json"
 
 # Expected identities. e05128fe is the verified RESTORE-001 installation the owner ordered preserved;
 # the release replaces it with the qualified Fault B commit, so the *candidate* is passed in.
@@ -140,6 +162,27 @@ def unit_timeout_sec() -> float | None:
     return parse_systemd_duration(props.get("TimeoutStopUSec", ""))
 
 
+def _drain_marker(principal_prefix: str) -> dict:
+    """Read the freeze marker without importing gateway code into this process."""
+    path = DRAIN_MARKER
+    try:
+        with open(path, encoding="utf-8") as fh:
+            body = json.load(fh)
+    except FileNotFoundError:
+        return {"present": False, "ok": False, "detail": f"no freeze marker at {path}"}
+    except Exception as exc:
+        return {"present": True, "ok": False, "detail": f"{path} unreadable: {exc}"}
+    principal = str(body.get("principal") or body.get("requested_by") or "")
+    owned = principal.startswith(principal_prefix)
+    age = None
+    try:
+        age = time.time() - float(body.get("requested_at") or body.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        age = None
+    detail = f"principal={principal or 'absent'} owned_by_release_freeze={owned} age_s={age}"
+    return {"present": True, "ok": owned, "detail": detail, "principal": principal, "age_s": age}
+
+
 def main_pid() -> int | None:
     props = systemctl_show("MainPID")
     try:
@@ -223,6 +266,36 @@ def db_stats() -> dict:
     return stats
 
 
+def runtime_gate_rows(phase: str, gw_state: dict, pid: int | None, head: str,
+                      principal_prefix: str = "release-freeze:") -> list[tuple]:
+    """The phase's runtime-state contract, as data so it can be tested without a live gateway.
+
+      ``pre``       the preserved installation is serving: running, not draining, nothing frozen
+      ``post``      the release holds its own freeze across the restart: draining, marker owned
+      ``released``  the release finished: candidate running, no freeze left behind
+      ``any``       structural only (pid/code checks), state not asserted
+    """
+    rows: list[tuple] = []
+    observed = gw_state.get("gateway_state")
+    marker = _drain_marker(principal_prefix)
+    if phase == "post":
+        # EXT-06: a correct post-release check runs *inside* the freeze it engaged. Requiring
+        # "running" here would make a correct release unverifiable; accepting either would let a
+        # verification pass with the service stopped. Draining + owned marker is the real contract.
+        rows.append(("runtime_state_frozen", observed == "draining",
+                     f"gateway_state={observed} (post-release verification runs inside the freeze)"))
+        rows.append(("admission_freeze_held", marker["ok"], marker["detail"]))
+    elif phase in {"pre", "released"}:
+        rows.append(("runtime_state_running", observed == "running",
+                     f"gateway_state={observed} exit_reason={gw_state.get('exit_reason')}"))
+        rows.append(("no_preexisting_freeze", not marker["present"], marker["detail"]))
+    rows.append(("runtime_state_pid_matches", gw_state.get("pid") == pid,
+                 f"state pid={gw_state.get('pid')} systemd MainPID={pid}"))
+    rows.append(("runtime_code_sha_matches_install", gw_state.get("code_sha") == head,
+                 f"code_sha={gw_state.get('code_sha')} install HEAD={head}"))
+    return rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", dest="json_path", default=None)
@@ -231,16 +304,37 @@ def main() -> int:
     ap.add_argument("--candidate", default=None,
                     help="commit SHA the release will deploy (checked for presence and ancestry)")
     ap.add_argument("--quiet-window", type=float, default=QUIET_WINDOW_S)
+    ap.add_argument("--phase", choices=["pre", "post", "released", "any"], default="pre",
+                    help="pre = before any mutation (gateway running); post = after the restart, "
+                         "with this run's admission freeze still engaged (gateway draining)")
+    ap.add_argument("--freeze-principal-prefix", default="release-freeze:",
+                    help="post phase: the drain marker must be owned by a release freeze")
+    ap.add_argument("--skip-oldgate", action="store_true",
+                    help="developer dry runs only; the release engine never passes it")
     args = ap.parse_args()
+    post = args.phase in {"post", "released"}
+    if post and not args.candidate:
+        print(json.dumps({"phase": args.phase, "verdict": "NO_GO",
+                          "failed": ["post_phase_requires_candidate"],
+                          "detail": "--phase post needs the exact --candidate"}, indent=2))
+        return 2
 
     g = Gates()
 
-    # 1. Installed identity — the owner ordered e05128fe/dc05abd0 preserved until this release swaps it.
+    # 1. Installed identity — phase-selected (EXT-07): pre must still be the preserved installation,
+    # post must be the candidate. One gate name, two expectations; the phase is in the detail string.
     rc, head = git("rev-parse", "HEAD")
     rc2, tree = git("rev-parse", "HEAD^{tree}")
     rc3, dirty = git("status", "--porcelain")
-    g.add("install_head", head == args.expect_head if rc == 0 else None, head or "unreadable")
-    g.add("install_tree", tree == args.expect_tree if rc2 == 0 else None, tree or "unreadable")
+    if post:
+        want_head = args.candidate
+        _, want_tree = git("rev-parse", f"{args.candidate}^{{tree}}")
+    else:
+        want_head, want_tree = args.expect_head, args.expect_tree
+    g.add("install_head", head == want_head if rc == 0 else None,
+          f"[{args.phase}] expected={want_head} observed={head or 'unreadable'}")
+    g.add("install_tree", (tree == want_tree) if (rc2 == 0 and bool(want_tree)) else None,
+          f"[{args.phase}] expected={want_tree} observed={tree or 'unreadable'}")
     g.add("install_clean", dirty == "" if rc3 == 0 else None,
           "clean" if dirty == "" else f"{len(dirty.splitlines())} modified path(s)")
 
@@ -292,21 +386,41 @@ def main() -> int:
     # 5b. Live runtime state: in-flight turns are counted here, and the pid must match systemd.
     gw_state: dict = {}
     try:
-        with open("/home/hermes/.hermes/gateway_state.json", encoding="utf-8") as fh:
+        with open(GW_STATE, encoding="utf-8") as fh:
             gw_state = json.load(fh)
     except Exception as exc:
         gw_state = {"error": str(exc)}
     g.add("runtime_state_readable", "error" not in gw_state, gw_state.get("error", "gateway_state.json"))
     if "error" not in gw_state:
-        g.add("runtime_state_running", gw_state.get("gateway_state") == "running",
-              f"gateway_state={gw_state.get('gateway_state')} exit_reason={gw_state.get('exit_reason')}")
-        g.add("runtime_state_pid_matches", gw_state.get("pid") == pid,
-              f"state pid={gw_state.get('pid')} systemd MainPID={pid}")
-        g.add("runtime_code_sha_matches_install", gw_state.get("code_sha") == head,
-              f"code_sha={gw_state.get('code_sha')} install HEAD={head}")
+        for name, ok, detail in runtime_gate_rows(args.phase, gw_state, pid, head,
+                                                 args.freeze_principal_prefix):
+            g.add(name, ok, detail)
+
+    # 5c. Old-runtime admission coverage (EXT-09). The release replaces the running code, so during
+    # the cutover the protection in force is the *deployed* drain/ESTOP machinery, not the guard the
+    # candidate ships. Proving it here means the freeze engages something that already refuses.
+    if args.phase != "pre":
+        g.add("old_runtime_coverage", True,
+              "not applicable once the restart has happened (the candidate's admission guard is live)",
+              critical=False)
+    elif args.skip_oldgate:
+        g.add("old_runtime_coverage", None, "--skip-oldgate: coverage not proven (developer dry run)")
+    else:
+        coverage = oldgate_report(INSTALL)
+        detail = (f"verdict={coverage['verdict']} producers={len(coverage['producers'])} "
+                  f"uncovered={coverage['uncovered'] or 'none'} unevaluable={coverage['unevaluable'] or 'none'}")
+        g.add("old_runtime_coverage", coverage["ok"], detail)
+        g.add("old_runtime_dynamic_gates", coverage["dynamic"].get("ok") is True,
+              "; ".join(f"{x['gate']}={'ok' if x['ok'] is True else 'FAIL'}"
+                        for x in coverage["dynamic"].get("gates", []))[:400])
 
     # 6. Quiet gate — no engineering turn should be mid-flight when the service is stopped.
-    state = session_state(args.quiet_window)
+    # A session store that cannot be read is *unevaluable*, never a crash: a traceback would emit no
+    # JSON at all and the engine would have to guess what happened.
+    try:
+        state = session_state(args.quiet_window)
+    except Exception as exc:  # noqa: BLE001 - any failure here is a fail-closed signal
+        state = {"error": f"session state unreadable: {type(exc).__name__}: {exc}"}
     if "error" in state:
         g.add("session_inventory", None, state["error"])
     else:
@@ -362,6 +476,8 @@ def main() -> int:
         "gates": g.rows,
         "failed": [r["gate"] for r in g.failed],
         "verdict": "GO" if not g.failed else "NO_GO",
+        "phase": args.phase,
+        "expect": {"head": want_head, "tree": want_tree, "candidate": args.candidate},
         "session_state": state,
         "db": stats,
         "service": props,

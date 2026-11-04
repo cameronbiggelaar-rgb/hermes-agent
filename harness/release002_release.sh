@@ -139,8 +139,35 @@ fi
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ARCHIVE=${ARCHIVE:-/home/hermes/work/HERMES-RESTORE-002/release-$STAMP}
 
-preflight() { # $1=head  $2=tree  -> prints JSON, exit 0 only when every critical gate passes
-  "$PY" "$ENGINE_DIR/release002_preflight.py" --expect-head "$1" --expect-tree "$2"
+LAUNCHER=${HERMES_RELEASE_LAUNCHER:-/usr/local/lib/hermes-release/hermes-release-002}
+MANIFEST=${HERMES_RELEASE_MANIFEST:-/usr/local/lib/hermes-release/manifest.json}
+POST_UNIT_SHA=""
+
+preflight() { # $1=phase  [$2=head $3=tree] -> prints JSON, exit 0 only when every critical gate passes
+  case "$1" in
+    pre)  "$PY" "$ENGINE_DIR/release002_preflight.py" --phase pre \
+            --expect-head "${2:-$EXPECT_HEAD}" --expect-tree "${3:-$EXPECT_TREE}" \
+            --candidate "$CANDIDATE" ;;
+    post|released)
+          "$PY" "$ENGINE_DIR/release002_preflight.py" --phase "$1" --candidate "$CANDIDATE" \
+            --expect-head "$CANDIDATE" --expect-tree "$CAND_TREE" ;;
+    *)    echo "preflight: unknown phase '$1'" >&2; return 64 ;;
+  esac
+}
+
+manifest_verify() { # $1=phase [$2=expected post unit sha256] -> prints JSON; 0 only when pinned ids hold
+  local phase=$1 expected=${2:-}
+  if [ ! -f "$MANIFEST" ]; then
+    warn "no release manifest at $MANIFEST"
+    return 1
+  fi
+  if [ -n "$expected" ]; then
+    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$INSTALL" \
+      --install "$INSTALL" --launcher "$LAUNCHER" --expected-post-unit-sha256 "$expected"
+  else
+    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$INSTALL" \
+      --install "$INSTALL" --launcher "$LAUNCHER"
+  fi
 }
 
 gateway_field() { # $1=field -> value from gateway_state.json, empty when unreadable
@@ -271,6 +298,39 @@ PYEOF
   journal unfreeze "admission restored: $why" 2>/dev/null || true
 }
 
+abort_before_mutation() { # $1=phase $2=reason -> NO_GO with zero changes and zero restarts (EXT-08)
+  local phase=$1 reason=$2 decision action
+  if [ "$MUTATED" -ne 0 ]; then
+    # Defensive: a pre-mutation abort is only valid before the first mutation. If that invariant is
+    # ever broken, undoing the mutation is the correct response, not pretending nothing happened.
+    warn "abort_before_mutation reached with MUTATED=1; deferring to rollback"
+    rollback "$reason"
+  fi
+  decision=$(ct failure --phase "$phase" --restart-attempts "$RESTART_ATTEMPTS" 2>/dev/null || echo '{}')
+  action=$(printf '%s' "$decision" | env -u PYTHONPATH "$PY3" -c \
+    'import json,sys;print(json.load(sys.stdin).get("action","needs_human"))' 2>/dev/null || echo needs_human)
+  PHASE=aborted
+  if [ -n "$ARCHIVE" ]; then
+    mkdir -p "$ARCHIVE"; printf '%s\n' "$decision" >"$ARCHIVE/no-go-decision.json" 2>/dev/null || true
+  fi
+  log "NO_GO before any mutation at phase '$phase': $reason (restart=no, rollback=no)"
+  if [ "$action" != "release_freeze" ]; then
+    warn "failure contract for '$phase' says '$action', not release_freeze: leaving state for a human"
+    journal aborted "NO_GO at $phase needs a human: $reason" 2>/dev/null || true
+    exit 2
+  fi
+  # Release only the freeze this run created: freeze_release clears the drain marker only when
+  # FROZEN=1 (ours) and the ESTOP sentinel only when ESTOP_OURS=1 (ours).
+  if [ "$FROZEN" -eq 1 ] || [ "$ESTOP_OURS" -eq 1 ]; then
+    freeze_release "NO_GO before mutation at $phase: $reason"
+  fi
+  journal aborted "NO_GO before mutation at $phase: $reason" --result ABORTED_SAFE 2>/dev/null || true
+  if [ -n "$ARCHIVE" ]; then
+    receipt "NO_GO_BEFORE_MUTATION" "$ARCHIVE/no-go-decision.json" 2>/dev/null || true
+  fi
+  exit 2
+}
+
 rollback() { # $1=reason
   local reason=$1
   PHASE=rollback
@@ -348,13 +408,23 @@ fi
 # ---------------------------------------------------------------- mode: verify only
 if [ "$MODE" = verify ]; then
   PHASE=verify-only
-  log "post-release verification against $CANDIDATE / $CAND_TREE (no mutation)"
+  phase=${VERIFY_PHASE:-released}
+  log "post-release verification against $CANDIDATE / $CAND_TREE (phase=$phase, no mutation)"
   set +e
-  preflight "$CANDIDATE" "$CAND_TREE"
+  preflight "$phase"
   RC=$?
   set -e
   log "preflight verdict rc=$RC"
   [ "$RC" -eq 0 ] || exit 2
+  if [ -f "$MANIFEST" ]; then
+    set +e
+    manifest_verify "$phase" >"${ARCHIVE:-/tmp}/verify-manifest.json" 2>&1
+    MRC=$?
+    set -e
+    tail -40 "${ARCHIVE:-/tmp}/verify-manifest.json" 2>/dev/null || true
+    log "manifest verification ($phase) rc=$MRC"
+    [ "$MRC" -eq 0 ] || exit 2
+  fi
   HOLD=$(systemctl show "$SERVICE" -p Environment --value | grep -c 'HERMES_RECOVERY_HOLD=1' || true)
   log "hold env entries: $HOLD"
   [ "$HOLD" -ge 1 ] || exit 2
@@ -383,7 +453,7 @@ fi
 PHASE=preflight
 log "preflight against $EXPECT_HEAD / $EXPECT_TREE"
 set +e
-preflight "$EXPECT_HEAD" "$EXPECT_TREE" >"$ARCHIVE/preflight-before.json" 2>"$ARCHIVE/preflight-before.err"
+preflight pre "$EXPECT_HEAD" "$EXPECT_TREE" >"$ARCHIVE/preflight-before.json" 2>"$ARCHIVE/preflight-before.err"
 PF_RC=$?
 set -e
 if [ "$MODE" = plan ]; then
@@ -417,6 +487,11 @@ if [ "$MODE" = plan ]; then
   Rollback on any failure after step 5: restore archived unit + drop-ins, daemon-reload,
   git reset --hard $EXPECT_HEAD, one restart, then release the freeze.
 EOF
+  set +e
+  manifest_verify pre >"$ARCHIVE/preflight-manifest.json" 2>"$ARCHIVE/preflight-manifest.err"
+  MF_RC=$?
+  set -e
+  log "manifest verification (pre) rc=$MF_RC (plan only; apply refuses on any failure)"
   ct admission --home "$HHOME" || true
   if [ "$PF_RC" -ne 0 ]; then
     log "DRY RUN RESULT: NO_GO — the release would refuse in this state (failed gates above)"
@@ -433,6 +508,18 @@ if [ "$PF_RC" -ne 0 ]; then
   exit 2
 fi
 log "preflight verdict GO"
+
+PHASE=manifest-pre
+set +e
+manifest_verify pre >"$ARCHIVE/manifest-pre.json" 2>"$ARCHIVE/manifest-pre.err"
+MF_RC=$?
+set -e
+if [ "$MF_RC" -ne 0 ]; then
+  grep -E '"(gate|failed|ok|phase)"' "$ARCHIVE/manifest-pre.json" 2>/dev/null \
+    || cat "$ARCHIVE/manifest-pre.err" 2>/dev/null || true
+  abort_before_mutation manifest "the staged manifest does not describe this installation (pre-release identities)"
+fi
+log "manifest verified against the pre-release identities"
 
 OTHER_ENGINES=$(pgrep -f 'release002_release\.sh --apply' | grep -v -e "^$$" -e "^$PPID$" || true)
 if [ -n "$OTHER_ENGINES" ]; then
@@ -496,13 +583,20 @@ HEAD_NOW=$(git -C "$INSTALL" rev-parse HEAD)
 TREE_NOW=$(git -C "$INSTALL" rev-parse HEAD^{tree})
 DIRTY=$(git -C "$INSTALL" status --porcelain)
 UNIT_SHA_NOW=$(sha256sum "$UNIT" | cut -d' ' -f1)
-[ "$HEAD_NOW" = "$EXPECT_HEAD" ] || rollback "install HEAD drifted to $HEAD_NOW before mutation"
-[ "$TREE_NOW" = "$EXPECT_TREE" ] || rollback "install tree drifted to $TREE_NOW before mutation"
-[ -z "$DIRTY" ] || rollback "install worktree became dirty before mutation"
+# EXT-08: every failure in this block happens with zero deployed mutations, so it must leave the
+# installation, the unit and the service exactly as they were and release only this run's freeze.
+[ "$HEAD_NOW" = "$EXPECT_HEAD" ] || abort_before_mutation revalidate "install HEAD drifted to $HEAD_NOW"
+[ "$TREE_NOW" = "$EXPECT_TREE" ] || abort_before_mutation revalidate "install tree drifted to $TREE_NOW"
+[ -z "$DIRTY" ] || abort_before_mutation revalidate "install worktree became dirty"
 [ "$UNIT_SHA_NOW" = "$(cut -d' ' -f1 "$ARCHIVE/unit/SHA256SUMS" | head -1)" ] \
-  || rollback "unit file changed between archive and mutation"
+  || abort_before_mutation revalidate "unit file changed between archive and mutation"
+set +e
+manifest_verify pre >"$ARCHIVE/manifest-revalidate.json" 2>&1
+MF2=$?
+set -e
+[ "$MF2" -eq 0 ] || abort_before_mutation revalidate "pre-release manifest identities no longer hold"
 ct admission --home "$HHOME" >"$ARCHIVE/admission-pre-mutation.json" 2>/dev/null \
-  || rollback "admission is not frozen/quiescent immediately before mutation"
+  || abort_before_mutation revalidate "admission is not frozen/quiescent"
 journal revalidate "identities and admission revalidated immediately before mutation"
 
 # ------------------------------------------------------------------- phase 5: deploy
@@ -535,6 +629,9 @@ case "$UNIT_TIMEOUT" in
   *) rollback "generated unit does not carry TimeoutStopSec=300s (got '${UNIT_TIMEOUT:-absent}')" ;;
 esac
 [ "$EFFECTIVE" = "5min" ] || rollback "effective TimeoutStopUSec is '$EFFECTIVE', expected 5min"
+POST_UNIT_SHA=$(sha256sum "$UNIT" | cut -d' ' -f1)
+[ -n "$POST_UNIT_SHA" ] || rollback "cannot checksum the regenerated unit"
+journal unit "regenerated unit sha256=$POST_UNIT_SHA effective=$EFFECTIVE"
 
 # ------------------------------------------------- phase 7: one controlled stop/start
 PHASE=restart
@@ -573,10 +670,24 @@ log "SIGKILL lines after restart: ${KILLS:-0}"
 # --------------------------------------------------------------------- phase 9: verification
 PHASE=verify-post
 set +e
-preflight "$CANDIDATE" "$CAND_TREE" >"$ARCHIVE/preflight-after.json" 2>"$ARCHIVE/preflight-after.err"
+preflight post >"$ARCHIVE/preflight-after.json" 2>"$ARCHIVE/preflight-after.err"
 PF2=$?
 set -e
-[ "$PF2" -eq 0 ] || rollback "post-release preflight NO_GO"
+if [ "$PF2" -ne 0 ]; then
+  grep -E '"(gate|failed|verdict)"' "$ARCHIVE/preflight-after.json" 2>/dev/null \
+    || cat "$ARCHIVE/preflight-after.err" 2>/dev/null || true
+  rollback "post-release preflight NO_GO (phase=post)"
+fi
+set +e
+manifest_verify post "$POST_UNIT_SHA" >"$ARCHIVE/manifest-post.json" 2>"$ARCHIVE/manifest-post.err"
+MF3=$?
+set -e
+if [ "$MF3" -ne 0 ]; then
+  grep -E '"(gate|failed|ok|phase)"' "$ARCHIVE/manifest-post.json" 2>/dev/null \
+    || cat "$ARCHIVE/manifest-post.err" 2>/dev/null || true
+  rollback "post-release manifest verification NO_GO (post_release identities)"
+fi
+log "post-release verification: preflight GO (phase=post, inside the freeze) and manifest post_release identities hold"
 HOLD_ENV=$(tr '\0' '\n' <"/proc/$NEW_PID/environ" | grep -c '^HERMES_RECOVERY_HOLD=1$' || true)
 [ "$HOLD_ENV" -eq 1 ] || rollback "recovery hold is not set in the new process environment"
 
@@ -591,7 +702,7 @@ PYEOF
 )
 log "session database: $python_compare"
 [ "$python_compare" = "same" ] || rollback "session inventory changed across the release ($python_compare)"
-journal verify "preflight GO, hold set, sessions unchanged, sigkill=0"
+journal verify "preflight GO (phase=post), manifest pre+post identities verified, hold set, sessions unchanged, sigkill=0"
 
 # ---------------------------------------------------------- phase 10: restore admission
 freeze_release "release verified"

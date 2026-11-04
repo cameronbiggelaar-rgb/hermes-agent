@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -53,6 +54,10 @@ PHASES = ("start", "stage", "preflight", "archive", "freeze", "quiesce", "revali
           "aborted", "recover", "rollback",
           "deploy", "restart", "verify", "unfreeze", "report")
 PHASES_AFTER_MUTATION = frozenset({"deploy", "restart", "verify"})
+# Everything up to and including revalidation happens with the running installation untouched.
+PRE_MUTATION_PHASES = frozenset({"start", "stage", "preflight", "archive", "freeze", "quiesce",
+                                 "revalidate", "aborted"})
+MAX_RESTART_ATTEMPTS = 1
 SETTLED_RESULTS = frozenset({"COMPLETE", "ROLLED_BACK", "ABORTED_SAFE"})
 
 
@@ -77,6 +82,12 @@ def state_db_path(home: Optional[Path] = None) -> Path:
 def gateway_state_path(home: Optional[Path] = None) -> Path:
     return (home or hermes_home()) / "gateway_state.json"
 
+
+def read_text(path: str | Path) -> Optional[str]:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 def sha256_file(path: str | Path) -> Optional[str]:
     try:
@@ -127,24 +138,86 @@ def blob_sha256(repo: str | Path, commit: str, path: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- manifest
+# ------------------------------------------------------------------ unit / phase helpers
+POST_RELEASE_TIMEOUT_STOP_SEC = 300.0
+MANIFEST_SCHEMA = 2
+
+_UNIT_SECONDS = {"us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1.0, "sec": 1.0,
+                 "second": 1.0, "seconds": 1.0, "m": 60.0, "min": 60.0, "minute": 60.0,
+                 "minutes": 60.0, "h": 3600.0, "hr": 3600.0, "hour": 3600.0, "hours": 3600.0}
+
+
+def parse_systemd_duration(text: str) -> Optional[float]:
+    """``300``/``300s``/``5min``/``1min 30s`` -> seconds. ``None`` for infinity or nonsense."""
+    value = (text or "").strip()
+    if not value or value.lower() in {"infinity", "0"}:
+        return None if value.lower() == "infinity" or not value else 0.0
+    if value.isdigit():
+        return float(value)
+    total = 0.0
+    seen = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", value):
+        scale = _UNIT_SECONDS.get(unit.lower())
+        if scale is None:
+            return None
+        total += float(number) * scale
+        seen = True
+    return total if seen else None
+
+
+def unit_timeout_stop_seconds(unit_path: "str | Path") -> Optional[float]:
+    """Effective ``TimeoutStopSec=`` of a unit file (the last assignment wins, as systemd does)."""
+    text = read_text(Path(unit_path))
+    if text is None:
+        return None
+    found: Optional[float] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        if key.strip() in ("TimeoutStopSec", "TimeoutStopUSec"):
+            found = parse_systemd_duration(raw)
+    return found
+
+
+# ------------------------------------------------------------------- manifest (EXT-07)
 def build_manifest(*, repo: str | Path, candidate: str, install: str | Path, launcher: str | Path,
                    unit: str | Path, dropins: "list[str | Path] | dict[str, str | Path]",
                    engine_paths: list[str],
                    expected_install_head: str) -> dict[str, Any]:
-    """Describe every identity the release depends on, pinned by checksum."""
+    """Describe every identity the release depends on, pinned by checksum.
+
+    Two identity sets, because the release *changes* the identity it was staged against (EXT-07):
+
+    * ``pre_release``  — what must be true up to the first mutation: the installation the release
+      replaces, the unit file as it stands, and the drop-ins that must survive untouched.
+    * ``post_release`` — what must be true afterwards: the candidate HEAD/tree, the regenerated
+      unit's effective ``TimeoutStopSec`` and the same drop-in bytes (a release may not quietly
+      retire the recovery hold or the timeout override).
+    """
     tree = object_tree(repo, candidate)
     install_ident = git_identity(install)
+    dropin_map = {Path(p).name: sha256_file(p) for p in dropins}
     return {
-        "schema": SCHEMA, "release": RELEASE,
+        "schema": MANIFEST_SCHEMA, "release": RELEASE,
         "candidate_commit": candidate, "candidate_tree": tree,
         "install_path": str(install),
-        "expected_install_head": expected_install_head,
-        "expected_install_tree": object_tree(install, expected_install_head),
+        "pre_release": {
+            "install_head": expected_install_head,
+            "install_tree": object_tree(install, expected_install_head),
+            "unit": {"path": str(unit), "sha256": sha256_file(unit)},
+            "dropins": dict(dropin_map),
+        },
+        "post_release": {
+            "install_head": candidate,
+            "install_tree": tree,
+            "unit": {"path": str(unit), "timeout_stop_sec": POST_RELEASE_TIMEOUT_STOP_SEC},
+            "dropins": dict(dropin_map),
+        },
         "observed_install_at_capture": {"head": install_ident.get("head"), "tree": install_ident.get("tree")},
         "engine": {p: {"blob_sha256": blob_sha256(repo, candidate, p)} for p in engine_paths},
         "launcher": {"path": str(launcher), "sha256": sha256_file(launcher)},
-        "unit": {"path": str(unit), "sha256": sha256_file(unit)},
-        "dropins": {Path(p).name: sha256_file(p) for p in dropins},
         "supervisor": {"runtime_max_sec": envelope_plan()["runtime_max_sec"],
                        "required_sec": envelope_plan()["required_sec"]},
         "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -152,19 +225,33 @@ def build_manifest(*, repo: str | Path, candidate: str, install: str | Path, lau
 
 
 def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str | Path,
-                    launcher: str | Path) -> dict[str, Any]:
-    """Fail-closed verification of the pinned identities.
+                    launcher: str | Path, phase: str = "pre",
+                    expected_post_unit_sha256: Optional[str] = None) -> dict[str, Any]:
+    """Fail-closed verification of the pinned identities, selected by release phase (EXT-07).
 
-    Every check is reported, in order; ``ok`` is true only when all of them hold AND every gate
-    could be evaluated (a missing file is a failure, never a skip).
+    ``phase="pre"``  — before any mutation: the install must still be the pre-release identity and
+    the unit must still be the archived bytes.
+    ``phase="post"`` — after the restart: the install must now be the *candidate* identity, the unit
+    must be the regenerated one (``TimeoutStopSec`` at the computed value, and the journaled checksum
+    when one is supplied), and the drop-ins must be byte-identical to the staged ones.
+    ``phase="any"``  — structural checks only (used by ``stage``/``status``).
+
+    Every check is reported, in order; ``ok`` is true only when all hold AND every gate could be
+    evaluated (a missing file is a failure, never a skip).
     """
     gates: list[dict[str, Any]] = []
 
     def gate(name: str, ok: Optional[bool], detail: str = "") -> None:
         gates.append({"gate": name, "ok": bool(ok), "detail": detail})
 
+    if phase not in {"pre", "post", "any"}:
+        return {"ok": False, "phase": phase, "gates": [{"gate": "phase", "ok": False,
+                "detail": f"unknown phase {phase!r}"}], "failed": ["phase"]}
+
+    pre = manifest.get("pre_release") or {}
+    post = manifest.get("post_release") or {}
     cand = manifest.get("candidate_commit") or ""
-    gate("schema", manifest.get("schema") == SCHEMA, f"schema={manifest.get('schema')!r}")
+    gate("schema", manifest.get("schema") == MANIFEST_SCHEMA, f"schema={manifest.get('schema')!r}")
     gate("candidate_commit_shape", len(cand) == 40 and all(c in "0123456789abcdef" for c in cand), cand)
     present = object_present(repo, cand) and object_present(install, cand)
     gate("candidate_available", present, f"repo={object_present(repo, cand)} install={object_present(install, cand)}")
@@ -193,30 +280,42 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
 
     ident = git_identity(install)
     gate("install_readable", bool(ident.get("ok")), str(ident.get("reason") or ""))
-    gate("install_head_expected", ident.get("head") == manifest.get("expected_install_head"),
-         f"expected={manifest.get('expected_install_head')} observed={ident.get('head')}")
-    gate("install_tree_expected", ident.get("tree") == manifest.get("expected_install_tree"),
-         f"expected={manifest.get('expected_install_tree')} observed={ident.get('tree')}")
     dirty = ident.get("dirty_files")
     gate("install_clean", dirty == [], f"{len(dirty or [])} changed path(s)")
 
-    unit = manifest.get("unit") or {}
-    unit_path = unit.get("path") or "/etc/systemd/system/hermes-gateway.service"
-    gate("unit_sha256", sha256_file(unit_path) == unit.get("sha256") and bool(unit.get("sha256")),
-         f"pinned={unit.get('sha256')} observed={sha256_file(unit_path)}")
-    for name, want in (manifest.get("dropins") or {}).items():
-        path = Path(unit_path).parent / f"{Path(unit_path).name}.d" / name
-        got = sha256_file(path)
-        gate(f"dropin:{name}", bool(want) and got == want, f"pinned={want} observed={got}")
+    if phase in {"pre", "post"}:
+        want_set = pre if phase == "pre" else post
+        gate(f"install_head_{phase}", ident.get("head") == want_set.get("install_head"),
+             f"expected={want_set.get('install_head')} observed={ident.get('head')}")
+        gate(f"install_tree_{phase}", ident.get("tree") == want_set.get("install_tree"),
+             f"expected={want_set.get('install_tree')} observed={ident.get('tree')}")
+        unit_want = (want_set.get("unit") or {})
+        unit_path = unit_want.get("path") or (manifest.get("unit") or {}).get("path") \
+            or "/etc/systemd/system/hermes-gateway.service"
+        if phase == "pre":
+            gate("unit_sha256_pre", sha256_file(unit_path) == unit_want.get("sha256") and bool(unit_want.get("sha256")),
+                 f"pinned={unit_want.get('sha256')} observed={sha256_file(unit_path)}")
+        else:
+            want_timeout = unit_want.get("timeout_stop_sec")
+            observed = unit_timeout_stop_seconds(unit_path)
+            gate("unit_timeout_post", observed is not None and want_timeout is not None
+                 and abs(float(observed) - float(want_timeout)) < 1e-6,
+                 f"expected TimeoutStopSec={want_timeout} observed={observed}")
+            if expected_post_unit_sha256:
+                gate("unit_sha256_post", sha256_file(unit_path) == expected_post_unit_sha256,
+                     f"journal={expected_post_unit_sha256} observed={sha256_file(unit_path)}")
+        for name, want in (want_set.get("dropins") or {}).items():
+            path = Path(unit_path).parent / f"{Path(unit_path).name}.d" / name
+            got = sha256_file(path)
+            gate(f"dropin_{phase}:{name}", bool(want) and got == want, f"pinned={want} observed={got}")
 
     sup = manifest.get("supervisor") or {}
     plan = envelope_plan()
     runtime_max = sup.get("runtime_max_sec")
     gate("supervisor_envelope", isinstance(runtime_max, int) and runtime_max >= plan["required_sec"],
-         f"runtime_max_sec={sup.get('runtime_max_sec')} required={plan['required_sec']}")
-
-    failed = [g["gate"] for g in gates if not g["ok"]]
-    return {"ok": not failed, "gates": gates, "failed": failed,
+         f"runtime_max_sec={runtime_max} required_sec={plan['required_sec']}")
+    failed = [row["gate"] for row in gates if row["ok"] is not True]
+    return {"ok": not failed, "phase": phase, "gates": gates, "failed": failed,
             "candidate_commit": cand, "candidate_tree": manifest.get("candidate_tree")}
 
 
@@ -459,6 +558,38 @@ def phase_record(journal: Optional[dict[str, Any]], *, phase: str, mutated: bool
     return journal
 
 
+def decide_failure(phase: str, *, mutated: bool, restart_attempts: int = 0) -> dict[str, Any]:
+    """What a failure at *phase* is allowed to do, decided before the release starts (EXT-08).
+
+    The owner's rule is simple and this function exists so no code path can forget it: **a failure
+    before the first mutation changes nothing and restarts nothing.** It releases the freeze marker
+    this run created, journals the abort and exits NO_GO. The rollback arm exists to undo *deployed*
+    changes, so reaching it with ``mutated=False`` would be a defect, not a safety measure — a drift
+    found during pre-mutation revalidation is exactly that case.
+
+    Actions:
+      ``release_freeze``  pre-mutation abort: zero deployment changes, zero restarts, exit 2
+      ``rollback``        mutation happened: restore the deployed identity and restart once
+      ``needs_human``     mutation may have happened but state is unknown — keep the freeze, never
+                          restart blind, and never restart a second time
+    """
+    if phase not in PHASES:
+        return {"action": "needs_human", "restart": False, "exit_code": 2,
+                "reason": f"unknown phase {phase!r}: refusing to guess"}
+    if not mutated:
+        if phase not in PRE_MUTATION_PHASES:
+            return {"action": "needs_human", "restart": False, "exit_code": 2,
+                    "reason": f"phase {phase!r} is post-mutation but nothing was recorded as mutated"}
+        return {"action": "release_freeze", "restart": False, "exit_code": 2,
+                "reason": f"NO_GO at {phase} before any mutation: nothing deployed, nothing restarted"}
+    if restart_attempts >= MAX_RESTART_ATTEMPTS:
+        return {"action": "needs_human", "restart": False, "exit_code": 2,
+                "reason": f"mutation at {phase} failed after {restart_attempts} restart attempt(s): "
+                          "keep the freeze and inspect"}
+    return {"action": "rollback", "restart": True, "exit_code": 2,
+            "reason": f"mutation at {phase} failed: restoring the deployed identity needs one restart"}
+
+
 def decide_recovery(journal: Optional[dict[str, Any]], facts: dict[str, Any]) -> dict[str, Any]:
     """Deterministic action for a supervisor that stopped without settling the journal.
 
@@ -551,6 +682,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     m = sub.add_parser("manifest", help="write or verify the pinned identity manifest")
     m.add_argument("--write", action="store_true")
     m.add_argument("--verify", action="store_true")
+    m.add_argument("--bootstrap", action="store_true",
+                   help="write the initial launcher-only manifest (no candidate staged yet)")
+    m.add_argument("--source-commit", default=None,
+                   help="bootstrap: the commit the launcher was taken from")
     m.add_argument("--path", default=MANIFEST_DEFAULT)
     m.add_argument("--repo", default=os.getcwd())
     m.add_argument("--install", default="/home/hermes/.hermes/hermes-agent")
@@ -558,6 +693,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     m.add_argument("--candidate", default="")
     m.add_argument("--expected-install-head", default="")
     m.add_argument("--unit", default="/etc/systemd/system/hermes-gateway.service")
+    m.add_argument("--phase", default="pre", choices=["pre", "post", "any"],
+                   help="which pinned identity set to verify (EXT-07)")
+    m.add_argument("--expected-post-unit-sha256", dest="expected_post_unit_sha256", default=None,
+                   help="journaled checksum of the regenerated unit, when the caller has it")
 
     a = sub.add_parser("admission", help="freeze/quiescence facts (read-only)")
     a.add_argument("--home", default="")
@@ -571,6 +710,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--repo", default="/home/hermes/.hermes/hermes-agent")
     r.add_argument("--candidate", default="")
     r.add_argument("--deployed", default="")
+
+    f = sub.add_parser("failure", help="what a failure at a phase may do (EXT-08)")
+    f.add_argument("--phase", required=True)
+    f.add_argument("--mutated", action="store_true")
+    f.add_argument("--restart-attempts", type=int, default=0)
 
     d = sub.add_parser("refresh-drain", help="keep-alive: re-stamp the freeze marker")
     d.add_argument("--home", default="")
@@ -592,6 +736,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         report = admission_report(home=Path(args.home) if args.home else None)
         # 0 frozen/idle, 2 proven NO_GO, 3 something could not be evaluated (never treated as idle).
         return _emit(report, 0 if report["ok"] else (2 if report["evaluable"] else 3))
+
+    if args.cmd == "failure":
+        decision = decide_failure(args.phase, mutated=args.mutated,
+                                  restart_attempts=args.restart_attempts)
+        return _emit(decision, decision["exit_code"])
 
     if args.cmd == "refresh-drain":
         body = refresh_drain_marker(home=Path(args.home) if args.home else None)
@@ -616,9 +765,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _emit(decision, 0 if decision["action"] != "needs_human" else 2)
 
     if args.cmd == "manifest":
+        if args.bootstrap:
+            if args.write or args.verify:
+                return _emit({"ok": False, "failed": ["bootstrap_conflicts_with_write_or_verify"]}, 64)
+            launcher_sha = sha256_file(args.launcher)
+            if not launcher_sha:
+                return _emit({"ok": False, "failed": ["launcher_unreadable"], "launcher": args.launcher}, 65)
+            if not args.source_commit or len(args.source_commit) != 40:
+                return _emit({"ok": False, "failed": ["source_commit_required"]}, 64)
+            payload = {
+                "schema": MANIFEST_SCHEMA, "release": RELEASE, "state": "bootstrapped",
+                "launcher": {"path": str(args.launcher), "sha256": launcher_sha},
+                "source_commit": args.source_commit,
+                "candidate_commit": "", "candidate_tree": None,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+            }
+            target = Path(args.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, target)   # atomic: a reader never sees a half-written manifest
+            readback = _read_json(target)
+            if not isinstance(readback, dict) or readback.get("launcher", {}).get("sha256") != launcher_sha:
+                return _emit({"ok": False, "failed": ["manifest_readback_mismatch"], "path": str(target)}, 65)
+            return _emit({"ok": True, "state": "bootstrapped", "path": str(target), "manifest": payload}, 0)
         if args.write:
             engine_paths = ["harness/release002_release.sh", "harness/release002_control.py",
-                            "harness/release002_preflight.py"]
+                            "harness/release002_preflight.py", "harness/release002_oldgate.py",
+                            "harness/hermes-release-002"]
             manifest = build_manifest(
                 repo=args.repo, candidate=args.candidate, install=args.install, launcher=args.launcher,
                 unit=args.unit, dropins=[f"{args.unit}.d/90-recovery-hold.conf",
@@ -630,7 +804,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         manifest = _read_json(Path(args.path))
         if not isinstance(manifest, dict):
             return _emit({"ok": False, "failed": ["manifest_unreadable"]}, 3)
-        report = verify_manifest(manifest, repo=args.repo, install=args.install, launcher=args.launcher)
+        report = verify_manifest(manifest, repo=args.repo, install=args.install, launcher=args.launcher,
+                                 phase=args.phase,
+                                 expected_post_unit_sha256=args.expected_post_unit_sha256)
         return _emit(report, 0 if report["ok"] else 2)
 
     return 64
