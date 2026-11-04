@@ -1,4 +1,4 @@
-# HERMES-RESTORE-002 — External CA review package (correction 3)
+# HERMES-RESTORE-002 — External CA review package (correction 4)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
@@ -14,15 +14,16 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling) | **`1cc36452f47cef911afde6da5139a56e9de2da7e`**, tree **`2ec9f4718f776f28e232b8aeffd5386f803a8258`** |
-| previous candidate (EXT-01/02 only, superseded by EXT-03/04/05) | `e8ed5b9b853aadef7b3830d0194275084b2449e8`, tree `913c0edc6d7cb9529259317a44a18fb63c0a2922` |
+| **release candidate** (code + tests + tooling, incl. EXT-06..09) | **`3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`**, tree **`8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b`** |
+| previous candidate (EXT-03/04/05, superseded by EXT-06..09) | `1cc36452f47cef911afde6da5139a56e9de2da7e`, tree `2ec9f4718f776f28e232b8aeffd5386f803a8258` |
+| previous candidate (EXT-01/02 only) | `e8ed5b9b853aadef7b3830d0194275084b2449e8`, tree `913c0edc6d7cb9529259317a44a18fb63c0a2922` |
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `1cc36452` / `2ec9f471` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `3b5c0fc4` / `8c34454e` |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..1cc36452` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..3b5c0fc4` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -840,11 +841,88 @@ is requested (it would resume zero sessions); `state.db` is never written by thi
 
 ---
 
+## 18. EXT-06..09 — the final release-path findings, closed
+
+The External CA accepted Fault B and EXT-03/04/05 in principle, then raised four release-path
+defects. Each is now a *separate* mechanism with its own negative controls, not a relaxed gate.
+
+### 18.1 EXT-06 — phase-aware verification (two verifiers, not one relaxed one)
+
+`release002_preflight.py` gained `--phase {pre,post,released,any}`. The release now runs **two**
+different checks:
+
+- `--phase pre` (before any mutation): pre-release identity, `gateway_state=running`, no
+  in-flight turn, no pre-existing freeze.
+- `--phase post` / `--phase released` (after the restart): **the frozen cutover state** —
+  `gateway_state=draining` with *this run's* `release-freeze:` marker engaged — plus deploy
+  artefacts and service state. This is a *stronger* assertion than `running`, not a weaker one.
+- A post phase without `--candidate` is a JSON `NO_GO` (`post_phase_requires_candidate`, exit 2),
+  so the engine can never mistake empty output for a pass. A sessions store that cannot be read is
+  reported as an *unevaluable* gate, never a traceback.
+
+Negative controls (each proves the verifier can still fail): a frozen cutover **verifies** (no
+`runtime_state_frozen`/`admission_freeze_held` in `failed`), while a `running` gateway fails
+`runtime_state_frozen`, a missing marker fails `admission_freeze_held`, and a foreign marker
+(`principal` not under `release-freeze:`) fails it too.
+
+### 18.2 EXT-07 — pre-release and post-release identities pinned separately
+
+`build_manifest` now writes **two** identity sets: `pre_release` (install HEAD/tree, unit and
+drop-in checksums at stage time) and `post_release` (candidate HEAD/tree, the regenerated unit's
+`TimeoutStopSec`, and the journaled post-unit checksum). `verify_manifest` selects by phase and
+reports every gate in order.
+
+Negative controls: pre verification passes on the pre-release installation and fails
+(`install_head_post`) after a real swap; post verification passes only after the swap *and* the
+regenerated unit at `TimeoutStopSec=300`, failing `unit_timeout_post` at any other value and
+`unit_sha256_post` when the journaled checksum is wrong.
+
+### 18.3 EXT-08 — a pre-mutation NO_GO is inert
+
+`decide_failure(phase, mutated=False)` maps every pre-mutation phase (`start`, `stage`, `preflight`,
+`archive`, `freeze`, `quiesce`, `revalidate`, `aborted`) to `release_freeze` — no restart, no
+rollback, releasing **only** the freeze this run created. `MAX_RESTART_ATTEMPTS = 1`. The engine's
+revalidate block routes every drift (HEAD, tree, dirty worktree, unit change, manifest identity,
+admission not frozen) to `abort_before_mutation()` (zero deployment changes, zero restarts,
+exit 2) instead of `rollback()`.
+
+Negative control, run against a fixture with a `systemctl` shim: `--plan` with drift exits 2 with
+`DRY RUN RESULT: NO_GO`, the shim logs **only `show`** (no stop/start/restart), the install HEAD is
+unchanged, no freeze marker or journal is written.
+
+### 18.4 EXT-09 — a verified bootstrap, and old-runtime admission protection
+
+`hermes-release-002 bootstrap` installs *this* launcher under `$LIB` byte-verified against its
+committed copy, idempotently, and writes a bootstrap manifest pinning the launcher's `sha256`,
+path, source commit and `state=boastrap` — refusing an uncommitted/edited launcher (exit 65), a
+second different launcher without `--force` (exit 65, previous launcher retained as `*-prev`), and
+an invocation already running from the install path.
+
+`release002_oldgate.py` proves the **deployed `e05128fe` runtime** — not the unshipped
+`execute_admission` guard — refuses new admissions through every producer during the cutover, via
+the drain marker and the ESTOP sentinel, and ships in `ENGINE_FILES` so the proof is re-run at
+release time. The static half reports any producer whose gate cannot be located as `uncovered`, and
+any unreadable source as `unevaluable` — never assumed covered.
+
+Negative controls: the deployed tree reports `covered`; removing the drain gate from a producer
+yields `messaging_inbound/drain_marker` in `uncovered`; renaming a gate definition yields
+`uncovered` with a "not defined in the deployed tree" detail; and bootstrap refuses an edited
+launcher.
+
+### 18.5 Evidence
+
+`tests/harness/test_release002_release_paths.py` adds 39 negative controls; `tests/harness`,
+`tests/gateway/test_admission_freeze_gate.py` and `tests/gateway/test_stop_budget_adaptation.py`
+pass **145** tests. Fault B tests are not re-run: their qualification is unchanged and already
+accepted.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `1cc36452f47cef911afde6da5139a56e9de2da7e` / tree `2ec9f4718f776f28e232b8aeffd5386f803a8258`,
+   `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef` / tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b`,
    retaining both drop-ins and the recovery hold.
 2. **Defer 6.6** (retirement of `95-timeout-stop.conf`) until 6.2 has passed and its timing +
    SIGKILL evidence is published.
