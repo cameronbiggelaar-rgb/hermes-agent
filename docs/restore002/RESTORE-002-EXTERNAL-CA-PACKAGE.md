@@ -1,4 +1,4 @@
-# HERMES-RESTORE-002 — External CA review package (correction 5)
+# HERMES-RESTORE-002 — External CA review package (correction 6)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
@@ -14,17 +14,18 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling, incl. EXT-06..10) | **`a4f08d6315072e6057984ae74dbf289736f9d110`**, tree **`27f8916b1eafbad3328e09139c21c7654645fe99`** |
+| **release candidate** (code + tests + tooling, incl. EXT-06..11) | **`7596026ab684d4b52935388bfc17bcaa948f2387`**, tree **`7e6042d786509439badf8eba554bd9890f039ab0`** |
+| previous candidate (EXT-06..10, superseded by EXT-11) | `a4f08d6315072e6057984ae74dbf289736f9d110`, tree `27f8916b1eafbad3328e09139c21c7654645fe99` |
 | previous candidate (EXT-06..09, superseded by EXT-10) | `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`, tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b` |
 | previous candidate (EXT-03/04/05) | `1cc36452f47cef911afde6da5139a56e9de2da7e`, tree `2ec9f4718f776f28e232b8aeffd5386f803a8258` |
 | previous candidate (EXT-01/02 only) | `e8ed5b9b853aadef7b3830d0194275084b2449e8`, tree `913c0edc6d7cb9529259317a44a18fb63c0a2922` |
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `a4f08d63` / `27f8916b` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `7596026a` / `7e6042d7` |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..a4f08d63` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..7596026a` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -971,11 +972,110 @@ Unchanged shutdown tests are not re-run.
 
 ---
 
+## 20. EXT-RESTORE-002-11 — the journaled unit checksum, made mandatory
+
+### 20.1 The defect
+
+`harness/release002_release.sh --verify-only` recovered the regenerated systemd unit's SHA-256 by
+scanning the release journal's free text for a `sha256=` token. Every failure mode of that scan
+produced the **same empty string**: no journal, unparseable journal, no `unit` phase, no note on the
+receipt, a truncated or upper-case digest. The empty string was then passed to `manifest_verify`,
+where `verify_manifest()` compared it against the unit's actual bytes only *if* it was non-empty.
+
+The result was a silent downgrade. With no checksum the exact-byte gate disappeared, and the only
+remaining unit proof was `unit_timeout_<phase>` — `TimeoutStopSec` at the computed value. Any number
+of different unit files satisfy that: a stray `Restart=no`, a changed `ExecStart`, an edited
+`KillMode`. Independent post-release verification could therefore report PASS while the deployed unit
+was not the unit the release generated.
+
+### 20.2 The correction (three layers, each fail-closed)
+
+**Layer 1 — the only way to obtain the checksum.** `release002_control.verify_unit_receipt()` accepts
+a journal, a candidate and (optionally) a run id and unit path, and returns the recorded digest only
+when *all* of the following hold; otherwise it returns `ok: false` with the failing gates named:
+
+| gate | requires |
+|---|---|
+| `journal` | the journal file exists and parses as an object |
+| `release` | it names `RESTORE-002` |
+| `journal_candidate` | its recorded candidate equals the one under verification |
+| `journal_run_id` | it carries an attempt id at all |
+| `run_id` | when the caller names the attempt, the ids are equal |
+| `deploy_receipt` | a `deploy` receipt names `head == candidate` — the attempt really deployed it |
+| `unit_receipt` | a `unit` receipt **after** that deploy receipt, carrying the same candidate |
+| `unit_checksum` | that receipt's `sha256` is exactly 64 lowercase hex characters, nothing else |
+| `unit_path` | when the caller names the unit path, the receipt records the same path |
+
+The checksum is a structured field, not a note: `phase_record()` now pins `candidate`, `head`,
+`sha256`, `unit_path` and the attempt's `run_id` into the journal, and the engine writes the unit
+receipt with `--sha256`/`--unit-path` at generation time. Nothing scrapes text any more.
+
+**Layer 2 — the manifest check cannot run without it.** In `verify_manifest()`, `post` and `released`
+compute `supplied` and `observed_sha = sha256_file(unit_path)` and gate on
+`SHA256_RE.match(supplied) and observed_sha == supplied`. An absent, empty, short, upper-case or
+prefixed digest fails `unit_sha256_<phase>` — it is a failed gate, never a skipped one. A missing unit
+file hashes to `None` and fails the same gate. `pre` keeps its original archived-bytes contract and
+`any` its structural-only contract; neither was weakened.
+
+**Layer 3 — no path reaches layer 2 without layer 1.** The engine's `--verify-only` calls
+`unit-receipt --print sha256` and exits 2 on any refusal; `manifest_verify()` itself refuses a
+`post`/`released` call whose checksum argument is empty; the launcher's `verify` recovers the checksum
+the same way before its released manifest check and passes it as `--expected-post-unit-sha256`, so
+`hermes-release-002 verify` has no order in which it can verify bytes it has not been given. All
+three sites name their phase explicitly (the EXT-10 lesson), and a structural test now fails the
+suite if any `manifest --verify` invocation appears without `--phase`.
+
+`verify --candidate SHA --run-id ID` binds the receipt to one attempt: the applied run id is printed
+by `apply` (`journalctl -u hermes-release-$run_id`), and the journal records it. Wrong-run, stale,
+wrong-candidate and pre-deploy receipts are all refused.
+
+### 20.3 Qualification — 42 cases through the real CLI
+
+Every case runs the real `release002_control.py` CLI and, for the composed path, the real
+`release002_release.sh --verify-only`, against a throwaway git repository, installation, systemd unit,
+drop-ins, manifest and journal under `tmp_path`. No case touches the installed tree, systemd, the
+gateway, the drop-ins or the recovery hold.
+
+| control | expected | where |
+|---|---|---|
+| valid journal + matching unit bytes | **PASS**, `unit_sha256_released` and `unit_timeout_released` both green | `test_released_passes_with_the_journaled_checksum`, `test_verify_only_passes_on_a_complete_release` |
+| missing journal | NO_GO, `journal` gate; `--verify-only` exits 2 | `test_missing_journal_refuses`, `test_verify_only_refuses_a_missing_journal` |
+| missing `unit`-phase receipt | NO_GO, `unit_receipt` | `test_missing_unit_receipt_refuses`, `test_verify_only_refuses_a_journal_without_a_unit_receipt` |
+| unit receipt predating the deploy | NO_GO, `unit_receipt` | `test_unit_receipt_that_predates_the_deploy_is_not_accepted` |
+| empty / short / long / non-hex / prefixed / absent checksum | NO_GO, `unit_checksum` (7 shapes) | `test_empty_or_malformed_checksum_refuses` |
+| **correct timeout, different unit bytes** | NO_GO on `unit_sha256_released` while `unit_timeout_released` stays green — the exact silent-skip shape | `test_released_refuses_a_matching_timeout_with_different_bytes` |
+| bytes changed after a valid receipt | NO_GO, `unit_sha256_released` | `test_verify_only_still_checks_identity_and_bytes` |
+| wrong candidate | NO_GO, `journal_candidate` / `unit_receipt` | `test_wrong_candidate_refuses`, `test_receipt_from_another_candidate_refuses` |
+| stale journal (deploy head ≠ candidate) | NO_GO, `deploy_receipt` | `test_stale_journal_without_a_matching_deploy_refuses` |
+| wrong run id (function and CLI and end-to-end) | NO_GO, `run_id`; `--verify-only` exits 2 | `test_wrong_run_id_refuses`, `test_cli_refuses_a_wrong_run_id`, `test_verify_only_rejects_a_wrong_attempt_id` |
+| journal with no attempt id at all | NO_GO, `journal_run_id` | `test_journal_without_a_run_id_refuses` |
+| receipt for a different unit path | NO_GO, `unit_path` | `test_wrong_unit_path_refuses` |
+| corrupt journal file | NO_GO, nothing printed on stdout | `test_cli_refuses_a_corrupt_journal` |
+| unknown `--print` field | argparse refuses — a typo cannot degrade into "printed nothing" | `test_cli_rejects_an_unknown_print_field` |
+| manifest deleted before verification | NO_GO, `no release manifest` (previously the whole check was skipped) | `test_verify_only_refuses_without_a_manifest` |
+| recovery hold absent | NO_GO, `hold env entries: 0` | `test_verify_only_refuses_when_the_hold_is_absent` |
+| identity gates still enforced with a good receipt | wrong HEAD refuses; both retained drop-ins verified | `test_released_*`, `verify_manifest` gates `install_head_released`, `install_tree_released`, `dropin_released:*` |
+| no bypass path reintroduced | source-level guards: no `sha256=` scraping, no phase-less `manifest --verify`, launcher `verify` orders `unit-receipt` before the manifest check | `TestNoBypassPath` (4 cases) |
+| qualification unit override | refused (rc 64) unless `HERMES_RELEASE_QUALIFY=1`; production always uses `/etc/systemd/system/hermes-gateway.service` | `test_qualify_unit_hook_requires_the_flag` |
+
+### 20.4 Evidence
+
+`tests/harness` + `tests/gateway/test_admission_freeze_gate.py` +
+`tests/gateway/test_stop_budget_adaptation.py`: **199 passed** (156 at EXT-10 close + 42 new in
+`tests/harness/test_release002_ext11.py` + 1 updated `test_post_phase_passes_after_a_real_swap` and
+its new negative control). Unchanged shutdown suites were not re-run.
+
+Candidate `7596026ab684d4b52935388bfc17bcaa948f2387`, tree `7e6042d786509439badf8eba554bd9890f039ab0`.
+No production mutation of any kind: no deployment, no staging, no restart, no systemd or drop-in edit,
+no merge, `HERMES_RECOVERY_HOLD=1` untouched, no session-database write.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `a4f08d6315072e6057984ae74dbf289736f9d110` / tree `27f8916b1eafbad3328e09139c21c7654645fe99`,
+   `7596026ab684d4b52935388bfc17bcaa948f2387` / tree `7e6042d786509439badf8eba554bd9890f039ab0`,
    retaining both drop-ins and the recovery hold.
 2. **Defer 6.6** (retirement of `95-timeout-stop.conf`) until 6.2 has passed and its timing +
    SIGKILL evidence is published.
