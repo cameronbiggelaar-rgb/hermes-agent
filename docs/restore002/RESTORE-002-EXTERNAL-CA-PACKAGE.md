@@ -1,4 +1,4 @@
-# HERMES-RESTORE-002 — External CA review package (correction 4)
+# HERMES-RESTORE-002 — External CA review package (correction 5)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
@@ -14,16 +14,17 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling, incl. EXT-06..09) | **`3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`**, tree **`8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b`** |
-| previous candidate (EXT-03/04/05, superseded by EXT-06..09) | `1cc36452f47cef911afde6da5139a56e9de2da7e`, tree `2ec9f4718f776f28e232b8aeffd5386f803a8258` |
+| **release candidate** (code + tests + tooling, incl. EXT-06..10) | **`a4f08d6315072e6057984ae74dbf289736f9d110`**, tree **`27f8916b1eafbad3328e09139c21c7654645fe99`** |
+| previous candidate (EXT-06..09, superseded by EXT-10) | `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef`, tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b` |
+| previous candidate (EXT-03/04/05) | `1cc36452f47cef911afde6da5139a56e9de2da7e`, tree `2ec9f4718f776f28e232b8aeffd5386f803a8258` |
 | previous candidate (EXT-01/02 only) | `e8ed5b9b853aadef7b3830d0194275084b2449e8`, tree `913c0edc6d7cb9529259317a44a18fb63c0a2922` |
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `3b5c0fc4` / `8c34454e` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `a4f08d63` / `27f8916b` |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..3b5c0fc4` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..a4f08d63` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -918,11 +919,63 @@ accepted.
 
 ---
 
+## 19. EXT-RESTORE-002-10 — the released verification phase, corrected
+
+The External CA accepted EXT-06/07/08/09 at code level and named one remaining defect: the
+independent post-release verification could not pass. `cmd_verify` ran `ctrl manifest --verify`
+with **no phase** (defaulting to `pre`, which demands the old installed HEAD/unit), while the
+engine's `--verify-only` path drove `released` — a phase `verify_manifest` did not accept.
+
+### 19.1 One phase contract across launcher, engine, manifest and preflight
+
+- `verify_manifest` accepts `released`, mapping it to the `post_release` identity set (candidate
+  HEAD/tree, regenerated unit, both retained drop-ins) with `released`-labelled gates
+  (`install_head_released`, `unit_timeout_released`, `unit_sha256_released`,
+  `dropin_released:90-recovery-hold.conf`, `dropin_released:95-timeout-stop.conf`).
+- The `ctrl manifest --verify --phase` choice list adds `released`; the default stays `pre`
+  (conservative — an omitted phase can never quietly become a released check).
+- `cmd_verify` now drives `--phase released`; `cmd_plan` and `cmd_apply` pin `--phase pre`
+  explicitly, so no call relies on the default.
+- The engine `--verify-only` path extracts the journaled regenerated-unit `sha256` and passes it to
+  `manifest_verify released`, so `released` verifies the regenerated unit's exact bytes, not only
+  its `TimeoutStopSec`.
+- `recover` uses `recover-plan`/`decide_recovery` (journal-driven, no phase), and `status`/`stage`
+  verify nothing — no other mismatched default remains.
+
+The six released assertions are therefore covered end to end: candidate HEAD/tree (manifest),
+regenerated unit identity (manifest timeout + journaled sha), both retained drop-ins (manifest),
+operational gateway state and cleared admission freeze (preflight `released`:
+`runtime_state_running` + `no_preexisting_freeze`), and intact recovery hold (engine environment
+gate).
+
+### 19.2 E2E negative/positive tests (real repo, launcher, unit, drop-ins, manifest)
+
+`tests/harness/test_release002_ext10.py` (11 cases) drives the real `manifest --verify` CLI against
+a real temporary Git repository, a real launcher copy, a real unit file and both drop-ins:
+
+- before deployment, `pre` passes and `released` refuses (`install_head_released`);
+- after a simulated deployment (install at the candidate, unit regenerated to `TimeoutStopSec=300`),
+  `released` passes with every identity gate evaluated;
+- wrong HEAD, a changed unit (`TimeoutStopSec=60`), wrong unit bytes (bad journaled sha), a missing
+  hold drop-in, and a remaining freeze each make `released` refuse — including a run of the real
+  `release002_preflight.py --phase released` against a home that still holds the drain marker.
+
+No production mutation occurs during qualification: the tests clone a throwaway repository and
+never touch the installed tree, systemd, the gateway, the drop-ins or the recovery hold.
+
+### 19.3 Evidence
+
+`tests/harness` + `tests/gateway/test_admission_freeze_gate.py` +
+`tests/gateway/test_stop_budget_adaptation.py` pass **156** tests (145 prior + 11 new EXT-10).
+Unchanged shutdown tests are not re-run.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `3b5c0fc4ee11efdd634b66aa1c0efc68feaec2ef` / tree `8c34454e0b115f3836eabe9f08fff8c2cb1b7a0b`,
+   `a4f08d6315072e6057984ae74dbf289736f9d110` / tree `27f8916b1eafbad3328e09139c21c7654645fe99`,
    retaining both drop-ins and the recovery hold.
 2. **Defer 6.6** (retirement of `95-timeout-stop.conf`) until 6.2 has passed and its timing +
    SIGKILL evidence is published.
