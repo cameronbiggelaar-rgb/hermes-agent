@@ -37,6 +37,10 @@ RELEASE = "RESTORE-002"
 MANIFEST_DEFAULT = "/usr/local/lib/hermes-release/manifest.json"
 JOURNAL_DEFAULT = "/var/lib/hermes-release/restore-002/journal.json"
 
+# A regenerated unit checksum is only meaningful as an exact 64-character lowercase hex digest.
+# Anything else (absent, truncated, upper-case, prefixed) is a NO_GO, never a skipped comparison.
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
 # The freeze engages two independent mechanisms so both halves of admission are closed:
 #   drain marker  -> external inbound turns, cron dispatch, published gateway_state "draining"
 #   ESTOP sentinel -> internal/self-injected turns, kanban watchers, goals loop and heartbeat ticks
@@ -52,8 +56,8 @@ ENVELOPE_SAFETY_SECONDS = 120      # slack for slow disk/telemetry before Runtim
 
 PHASES = ("start", "stage", "preflight", "archive", "freeze", "quiesce", "revalidate",
           "aborted", "recover", "rollback",
-          "deploy", "restart", "verify", "unfreeze", "report")
-PHASES_AFTER_MUTATION = frozenset({"deploy", "restart", "verify"})
+          "deploy", "unit", "restart", "verify", "unfreeze", "report")
+PHASES_AFTER_MUTATION = frozenset({"deploy", "unit", "restart", "verify"})
 # Everything up to and including revalidation happens with the running installation untouched.
 PRE_MUTATION_PHASES = frozenset({"start", "stage", "preflight", "archive", "freeze", "quiesce",
                                  "revalidate", "aborted"})
@@ -232,8 +236,9 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     ``phase="pre"``  — before any mutation: the install must still be the pre-release identity and
     the unit must still be the archived bytes.
     ``phase="post"`` — after the restart: the install must now be the *candidate* identity, the unit
-    must be the regenerated one (``TimeoutStopSec`` at the computed value, and the journaled checksum
-    when one is supplied), and the drop-ins must be byte-identical to the staged ones.
+    must be the regenerated one (``TimeoutStopSec`` at the computed value **and** a valid journaled
+    64-hex checksum matching the file's actual bytes), and the drop-ins must be byte-identical to the
+    staged ones. The checksum is mandatory here: passing ``None`` is a failed gate, not a skip.
     ``phase="released"`` — the independent post-release check: the same candidate identity set as
     ``post`` (candidate HEAD/tree, regenerated unit, both retained drop-ins), named with a
     ``released`` label so it can be driven without re-entering the freeze.
@@ -305,9 +310,14 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
             gate(f"unit_timeout_{label}", observed is not None and want_timeout is not None
                  and abs(float(observed) - float(want_timeout)) < 1e-6,
                  f"expected TimeoutStopSec={want_timeout} observed={observed}")
-            if expected_post_unit_sha256:
-                gate(f"unit_sha256_{label}", sha256_file(unit_path) == expected_post_unit_sha256,
-                     f"journal={expected_post_unit_sha256} observed={sha256_file(unit_path)}")
+            # EXT-11: the exact-byte comparison is mandatory in post/released. An absent, empty or
+            # malformed checksum is a NO_GO gate, never a skipped one -- otherwise a missing journal
+            # receipt would leave only the timeout-value check, which a different unit still passes.
+            supplied = (expected_post_unit_sha256 or "").strip().lower()
+            observed_sha = sha256_file(unit_path)
+            gate(f"unit_sha256_{label}",
+                 bool(SHA256_RE.match(supplied)) and observed_sha == supplied,
+                 f"journal={supplied or '<absent>'} observed={observed_sha}")
         for name, want in (want_set.get("dropins") or {}).items():
             path = Path(unit_path).parent / f"{Path(unit_path).name}.d" / name
             got = sha256_file(path)
@@ -321,6 +331,94 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     failed = [row["gate"] for row in gates if row["ok"] is not True]
     return {"ok": not failed, "phase": phase, "gates": gates, "failed": failed,
             "candidate_commit": cand, "candidate_tree": manifest.get("candidate_tree")}
+
+
+def verify_unit_receipt(journal: Optional[dict[str, Any]], *, candidate: str,
+                        run_id: Optional[str] = None,
+                        unit_path: Optional[str | Path] = None) -> dict[str, Any]:
+    """Fail-closed recovery of the regenerated unit checksum from the release journal (EXT-11).
+
+    The independent ``--verify-only`` path needs the regenerated unit's SHA-256 to prove *exact
+    bytes*. Recovering it by scanning journal notes is not enough: a missing journal, a journal
+    without a ``unit`` receipt, or a truncated note used to yield an empty string, which the
+    manifest check then treated as "no expectation" and skipped. This function is the only way the
+    checksum may be obtained, and it refuses rather than returning anything unusable.
+
+    A receipt is accepted only when **all** of the following hold:
+
+    * the journal exists, parses, and names ``release == RELEASE`` and a 40-hex ``candidate``;
+    * that recorded candidate equals *candidate* (and *run_id* matches when supplied);
+    * a ``deploy`` receipt names ``head == candidate`` (the attempt actually deployed it);
+    * a ``unit`` receipt follows that deploy receipt, carries the same ``candidate``, and records
+      a ``sha256`` that is exactly 64 lowercase hex characters.
+
+    Returns ``{"ok": True, "sha256": ..., "run_id": ..., "unit_path": ...}`` or
+    ``{"ok": False, "failed": [gate, ...]}``. Callers treat ``ok is not True`` as NO_GO.
+    """
+    gates: list[dict[str, Any]] = []
+
+    def gate(name: str, ok: Optional[bool], detail: str = "") -> None:
+        gates.append({"gate": name, "ok": bool(ok), "detail": detail})
+
+    def done() -> dict[str, Any]:
+        failed = [row["gate"] for row in gates if row["ok"] is not True]
+        return {"ok": not failed, "failed": failed, "gates": gates}
+
+    want_cand = (candidate or "").strip().lower()
+    gate("candidate_shape",
+         len(want_cand) == 40 and all(c in "0123456789abcdef" for c in want_cand), want_cand)
+    if journal is None or not isinstance(journal, dict):
+        gate("journal", False, "missing or unreadable")
+        return done()
+    gate("release", journal.get("release") == RELEASE, str(journal.get("release")))
+    journal_cand = str(journal.get("candidate") or "").strip().lower()
+    gate("journal_candidate", journal_cand == want_cand,
+         f"journal={journal_cand or '<absent>'} expected={want_cand}")
+    journal_run = str(journal.get("run_id") or "").strip()
+    gate("journal_run_id", bool(journal_run), journal_run or "<absent>")
+    if run_id is not None:
+        gate("run_id", journal_run == str(run_id).strip(),
+             f"journal={journal_run or '<absent>'} expected={run_id}")
+
+    phases = journal.get("phases") or []
+    deploy_at = None
+    for i, ph in enumerate(phases):
+        if ph.get("phase") != "deploy":
+            continue
+        head = str(ph.get("head") or "").strip().lower()
+        if head == want_cand:
+            deploy_at = i
+    gate("deploy_receipt", deploy_at is not None,
+         f"no deploy receipt for candidate {want_cand}" if deploy_at is None
+         else f"index={deploy_at}")
+
+    unit_record: Optional[dict[str, Any]] = None
+    if deploy_at is not None:
+        for ph in phases[deploy_at + 1:]:
+            if ph.get("phase") == "unit":
+                unit_record = ph
+    if deploy_at is None:
+        gate("unit_receipt", False, "no bounded deploy receipt to follow")
+    elif unit_record is None:
+        gate("unit_receipt", False, "no unit receipt after the deploy receipt")
+    else:
+        rec_cand = str(unit_record.get("candidate") or "").strip().lower()
+        gate("unit_receipt", rec_cand == want_cand,
+             f"receipt candidate={rec_cand or '<absent>'} expected={want_cand}")
+        recorded = str(unit_record.get("sha256") or "").strip().lower()
+        gate("unit_checksum", bool(SHA256_RE.match(recorded)),
+             f"recorded={recorded or '<absent>'}" if recorded else "no sha256 recorded")
+        if unit_path is not None:
+            rec_path = str(unit_record.get("unit_path") or "")
+            gate("unit_path", rec_path == str(unit_path),
+                 f"journal={rec_path or '<absent>'} expected={unit_path}")
+
+    result = done()
+    if result["ok"] and unit_record is not None:
+        result.update({"sha256": str(unit_record.get("sha256")).strip().lower(),
+                       "run_id": journal_run,
+                       "unit_path": str((unit_record or {}).get("unit_path") or "")})
+    return result
 
 
 # --------------------------------------------------------------------------- envelope
@@ -546,13 +644,30 @@ def write_journal(journal: dict[str, Any], path: str | Path = JOURNAL_DEFAULT) -
 
 def phase_record(journal: Optional[dict[str, Any]], *, phase: str, mutated: bool = False,
                  restart_attempts: Optional[int] = None, result: Optional[str] = None,
-                 note: str = "") -> dict[str, Any]:
-    """Append (or update) a phase in the journal, keeping the full ordered history."""
+                 note: str = "", extra: Optional[dict[str, Any]] = None,
+                 run_id: Optional[str] = None) -> dict[str, Any]:
+    """Append (or update) a phase in the journal, keeping the full ordered history.
+
+    *extra* adds structured, machine-checkable fields to the record (EXT-11: the ``unit`` receipt
+    carries ``candidate``, ``sha256`` and ``unit_path`` so the checksum is never recovered by
+    scraping free text). Every record also pins ``candidate`` when the caller supplies it, so a
+    journal can never be replayed against a different candidate.
+    """
     journal = dict(journal or {})
     journal.setdefault("release", RELEASE)
-    journal.setdefault("run_id", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    if run_id:
+        journal["run_id"] = run_id          # the engine's attempt id, not a fresh timestamp
+    else:
+        journal.setdefault("run_id", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     journal.setdefault("phases", [])
-    journal["phases"].append({"phase": phase, "at": datetime.now(timezone.utc).isoformat(), "note": note})
+    record: dict[str, Any] = {"phase": phase, "at": datetime.now(timezone.utc).isoformat(),
+                             "note": note}
+    for key, value in (extra or {}).items():
+        if value is not None:
+            record[key] = value
+            if key == "candidate":
+                journal["candidate"] = value      # journal-level: the attempt's one candidate
+    journal["phases"].append(record)
     journal["phase"] = phase
     journal["mutated"] = bool(journal.get("mutated")) or bool(mutated)
     if restart_attempts is not None:
@@ -730,6 +845,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     j.add_argument("--restart-attempts", type=int, default=None)
     j.add_argument("--result", default=None)
     j.add_argument("--note", default="")
+    j.add_argument("--candidate", default=None, help="structured: the attempt's exact candidate")
+    j.add_argument("--head", default=None, help="structured: deployed HEAD (deploy receipts)")
+    j.add_argument("--sha256", dest="sha256", default=None,
+                   help="structured: the regenerated unit checksum (unit receipts)")
+    j.add_argument("--unit-path", default=None, help="structured: the unit file hashed")
+    j.add_argument("--run-id", dest="run_id", default=None,
+                   help="structured: the attempt id this record belongs to")
+
+    u = sub.add_parser("unit-receipt",
+                       help="fail-closed recovery of the regenerated unit checksum (EXT-11)")
+    u.add_argument("--journal", default=JOURNAL_DEFAULT)
+    u.add_argument("--candidate", required=True)
+    u.add_argument("--run-id", default=None, help="when supplied, the journal run id must match")
+    u.add_argument("--unit-path", default=None, help="when supplied, the journal path must match")
+    u.add_argument("--print", dest="print_field", default=None, choices=["sha256"],
+                   help="on success print only this field; JSON detail goes to stderr")
 
     args = parser.parse_args(argv)
 
@@ -754,10 +885,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.phase:
             journal = read_journal(args.path)
             return _emit({"journal": journal}, 0 if journal else 3)
+        extra = {"candidate": args.candidate, "head": args.head,
+                 "sha256": args.sha256, "unit_path": args.unit_path}
         journal = phase_record(read_journal(args.path), phase=args.phase, mutated=args.mutated,
-                               restart_attempts=args.restart_attempts, result=args.result, note=args.note)
+                               restart_attempts=args.restart_attempts, result=args.result,
+                               note=args.note, extra=extra, run_id=args.run_id)
         write_journal(journal, args.path)
         return _emit({"journal": journal}, 0)
+
+    if args.cmd == "unit-receipt":
+        receipt = verify_unit_receipt(read_journal(args.journal), candidate=args.candidate,
+                                      run_id=args.run_id, unit_path=args.unit_path)
+        if args.print_field:
+            if receipt.get("ok") and receipt.get(args.print_field):
+                print(receipt[args.print_field])
+                json.dump(receipt, sys.stderr, sort_keys=True)
+                sys.stderr.write("\n")
+                return 0
+            json.dump(receipt, sys.stderr, indent=2, sort_keys=True)
+            sys.stderr.write("\n")
+            return 2
+        return _emit(receipt, 0 if receipt.get("ok") else 2)
 
     if args.cmd == "recover-plan":
         journal = read_journal(args.journal)

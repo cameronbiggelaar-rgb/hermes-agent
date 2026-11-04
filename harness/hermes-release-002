@@ -17,7 +17,10 @@
 #   hermes-release-002 status            read-only: pins, service, freeze markers, journal
 #   hermes-release-002 stage  --candidate SHA   extract + pin engine, write manifest (root)
 #   hermes-release-002 plan   --candidate SHA   dry run: manifest + preflight, no mutation
-#   hermes-release-002 verify --candidate SHA   post-release verification, no mutation
+#   hermes-release-002 verify --candidate SHA [--run-id ID]
+#                                        post-release verification, no mutation (refuses unless the
+#                                        journal holds a valid unit receipt for this candidate, and
+#                                        for this attempt when --run-id is given)
 #   hermes-release-002 apply  --candidate SHA   one controlled stop/start from a transient unit
 #   hermes-release-002 recover --candidate SHA  deterministic handling of an interrupted supervisor
 #
@@ -60,6 +63,8 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --source-commit) SOURCE_COMMIT=$2; shift 2 ;;
     --candidate) CANDIDATE=$2; shift 2 ;;
+    --run-id) RUN_ID_ARG=$2; shift 2 ;;
+    --run-id=*) RUN_ID_ARG=${1#*=}; shift ;;
     --candidate=*) CANDIDATE=${1#*=}; shift ;;
     --repo) REPO=$2; shift 2 ;;
     --detach) DETACH=1; shift ;;
@@ -335,8 +340,25 @@ cmd_plan() {
 
 cmd_verify() {
   require_root; prepare_engine
+  local unit=/etc/systemd/system/$SERVICE sha rc=0 err
+  local rid=()
+  # --run-id (or HERMES_RELEASE_RUN_ID) binds the journal receipt to one exact release attempt.
+  if [ -n "${RUN_ID_ARG:-}" ]; then rid=(--run-id "$RUN_ID_ARG"); export HERMES_RELEASE_RUN_ID="$RUN_ID_ARG"; fi
+  err=$(mktemp "${TMPDIR:-/tmp}/hermes-release-unit-receipt.XXXXXX")
+  # EXT-11: the released manifest check needs the journaled regenerated-unit checksum, and there is
+  # no path that verifies without one. Recover it fail-closed from the validated receipt first.
+  sha=$(ctrl unit-receipt --journal "$JOURNAL" --candidate "$CANDIDATE" \
+          --unit-path "$unit" "${rid[@]}" --print sha256 2>"$err") || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
+    log "REFUSED: no valid regenerated-unit receipt in $JOURNAL (rc=$rc)"
+    sed -n '1,40p' "$err" >&2 || true
+    rm -f "$err"
+    exit 2
+  fi
+  rm -f "$err"
   ctrl manifest --verify --phase released --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
-    --launcher "$SELF" --candidate "$CANDIDATE" >/dev/null || { log "manifest verification FAILED"; exit 2; }
+    --launcher "$SELF" --candidate "$CANDIDATE" --expected-post-unit-sha256 "$sha" >/dev/null \
+    || { log "manifest verification FAILED"; exit 2; }
   "$ENGINE_DIR/harness/release002_release.sh" --verify-only --candidate "$CANDIDATE"
 }
 

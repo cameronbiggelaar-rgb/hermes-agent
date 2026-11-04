@@ -244,9 +244,22 @@ class TestSeparatePrePostIdentities:
         m = self._manifest(repo, base, cand, inst, unit)
         run(["git", "-C", str(inst), "fetch", "-q", str(repo), cand], check=True)
         run(["git", "-C", str(inst), "merge", "--ff-only", "-q", cand], check=True)
-        rep = ctl.verify_manifest(m, repo=repo, install=inst, launcher=repo / LAUNCHER, phase="post")
+        rep = ctl.verify_manifest(m, repo=repo, install=inst, launcher=repo / LAUNCHER, phase="post",
+                                  expected_post_unit_sha256=ctl.sha256_file(unit))
         assert rep["ok"] is True, rep["failed"]
         assert "install_head_post" not in rep["failed"]
+
+    def test_post_phase_refuses_without_a_journaled_checksum(self, tmp_path):
+        """EXT-11: an omitted checksum must be a gate failure, not a skipped comparison."""
+        repo, base, cand, inst, unit = self._fixture(tmp_path)
+        m = self._manifest(repo, base, cand, inst, unit)
+        run(["git", "-C", str(inst), "fetch", "-q", str(repo), cand], check=True)
+        run(["git", "-C", str(inst), "merge", "--ff-only", "-q", cand], check=True)
+        for omitted in (None, "", "not-a-digest", "0" * 63):
+            rep = ctl.verify_manifest(m, repo=repo, install=inst, launcher=repo / LAUNCHER,
+                                      phase="post", expected_post_unit_sha256=omitted)
+            assert rep["ok"] is False, omitted
+            assert "unit_sha256_post" in rep["failed"], (omitted, rep["failed"])
 
     def test_post_phase_rejects_a_regenerated_unit_at_the_wrong_timeout(self, tmp_path):
         repo, base, cand, inst, unit = self._fixture(tmp_path)

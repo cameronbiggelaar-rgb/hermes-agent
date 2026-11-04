@@ -20,7 +20,16 @@ set -euo pipefail
 
 INSTALL=${HERMES_RELEASE_INSTALL:-/home/hermes/.hermes/hermes-agent}
 SERVICE=hermes-gateway.service
-UNIT=/etc/systemd/system/$SERVICE
+# The unit path is the production systemd path, always. The isolated qualification harness may point
+# it at a temporary unit, but only with the explicit flag below, so no environment can silently
+# redirect a real release's unit (EXT-11 qualification hook).
+if [ -n "${HERMES_RELEASE_QUALIFY_UNIT:-}" ]; then
+  [ "${HERMES_RELEASE_QUALIFY:-}" = "1" ] \
+    || { echo "refusing HERMES_RELEASE_QUALIFY_UNIT without HERMES_RELEASE_QUALIFY=1" >&2; exit 64; }
+  UNIT=$HERMES_RELEASE_QUALIFY_UNIT
+else
+  UNIT=/etc/systemd/system/$SERVICE
+fi
 DROPIN_DIR=$UNIT.d
 HOLD_DROPIN=$DROPIN_DIR/90-recovery-hold.conf
 TIMEOUT_DROPIN=$DROPIN_DIR/95-timeout-stop.conf
@@ -82,8 +91,10 @@ journal() { # journal <phase> [note] [extra ct args...]
   PHASE=$phase
   if [ "$MODE" = plan ]; then return 0; fi
   mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  # Every record pins the attempt's exact candidate, so a journal can never be replayed against a
+  # different candidate and a stale attempt is detectable on its own (EXT-11).
   env -u PYTHONPATH "$PY3" "$ENGINE_DIR/release002_control.py" journal --path "$JOURNAL" \
-    --phase "$phase" --note "$note" "$@" >/dev/null 2>&1 \
+    --phase "$phase" --note "$note" --candidate "$CANDIDATE" --run-id "$RUN_ID" "$@" >/dev/null 2>&1 \
     || warn "journal write failed for phase $phase"
 }
 
@@ -157,6 +168,15 @@ preflight() { # $1=phase  [$2=head $3=tree] -> prints JSON, exit 0 only when eve
 
 manifest_verify() { # $1=phase [$2=expected post unit sha256] -> prints JSON; 0 only when pinned ids hold
   local phase=$1 expected=${2:-}
+  case "$phase" in
+    post|released)
+      # EXT-11: these phases prove the deployed unit byte-for-byte. Without a journaled checksum
+      # there is nothing to compare against, so the call is refused rather than run unguarded.
+      if [ -z "$expected" ]; then
+        warn "manifest verification ($phase) requires the journaled unit checksum -- refusing to skip exact-byte proof"
+        return 1
+      fi ;;
+  esac
   if [ ! -f "$MANIFEST" ]; then
     warn "no release manifest at $MANIFEST"
     return 1
@@ -416,29 +436,31 @@ if [ "$MODE" = verify ]; then
   set -e
   log "preflight verdict rc=$RC"
   [ "$RC" -eq 0 ] || exit 2
-  if [ -f "$MANIFEST" ]; then
-    POST_UNIT_SHA=$("$PY" - "$JOURNAL" 2>/dev/null <<'PYEOF'
-import json, sys
-try:
-    j = json.load(open(sys.argv[1]))
-except Exception:
-    print(""); raise SystemExit
-for ph in reversed(j.get("phases") or []):
-    if ph.get("phase") == "unit":
-        for tok in (ph.get("note") or "").split():
-            if tok.startswith("sha256="):
-                print(tok.split("=", 1)[1]); raise SystemExit
-print("")
-PYEOF
-)
-    set +e
-    manifest_verify "$phase" "$POST_UNIT_SHA" >"${ARCHIVE:-/tmp}/verify-manifest.json" 2>&1
-    MRC=$?
-    set -e
-    tail -40 "${ARCHIVE:-/tmp}/verify-manifest.json" 2>/dev/null || true
-    log "manifest verification ($phase) rc=$MRC (post-unit sha256 ${POST_UNIT_SHA:+present})"
-    [ "$MRC" -eq 0 ] || exit 2
+  # EXT-11: the regenerated unit's exact checksum comes only from a validated journal receipt.
+  # A missing journal, a missing unit receipt or a malformed digest is a NO_GO -- never an empty
+  # string that would leave the manifest check with nothing to compare.
+  mkdir -p "$ARCHIVE" 2>/dev/null || true
+  # Bind the checksum to this exact attempt: when the operator names the attempt id it must match.
+  RID_ARGS=()
+  if [ -n "${HERMES_RELEASE_RUN_ID:-}" ]; then RID_ARGS=(--run-id "$HERMES_RELEASE_RUN_ID"); fi
+  set +e
+  POST_UNIT_SHA=$(ct unit-receipt --journal "$JOURNAL" --candidate "$CANDIDATE" \
+                    --unit-path "$UNIT" "${RID_ARGS[@]}" --print sha256 2>"$ARCHIVE/unit-receipt.json")
+  URC=$?
+  set -e
+  if [ "$URC" -ne 0 ] || [ -z "$POST_UNIT_SHA" ]; then
+    warn "no valid regenerated-unit receipt in $JOURNAL (rc=$URC) -- refusing to verify"
+    [ -f "$ARCHIVE/unit-receipt.json" ] && sed -n '1,40p' "$ARCHIVE/unit-receipt.json"
+    exit 2
   fi
+  log "journaled unit receipt: sha256=$POST_UNIT_SHA"
+  set +e
+  manifest_verify "$phase" "$POST_UNIT_SHA" >"${ARCHIVE:-/tmp}/verify-manifest.json" 2>&1
+  MRC=$?
+  set -e
+  tail -40 "${ARCHIVE:-/tmp}/verify-manifest.json" 2>/dev/null || true
+  log "manifest verification ($phase) rc=$MRC (post-unit sha256 $POST_UNIT_SHA)"
+  [ "$MRC" -eq 0 ] || exit 2
   HOLD=$(systemctl show "$SERVICE" -p Environment --value | grep -c 'HERMES_RECOVERY_HOLD=1' || true)
   log "hold env entries: $HOLD"
   [ "$HOLD" -ge 1 ] || exit 2
@@ -626,7 +648,7 @@ fi
 if [ -n "$(git -C "$INSTALL" status --porcelain)" ]; then
   rollback "working tree dirty after merge"
 fi
-journal deploy "deployed $HEAD tree $TREE"
+journal deploy "deployed $HEAD tree $TREE" --head "$HEAD"
 log "deployed HEAD=$HEAD tree=$TREE"
 
 # --------------------------------------------------------------- phase 6: regenerate unit
@@ -645,7 +667,8 @@ esac
 [ "$EFFECTIVE" = "5min" ] || rollback "effective TimeoutStopUSec is '$EFFECTIVE', expected 5min"
 POST_UNIT_SHA=$(sha256sum "$UNIT" | cut -d' ' -f1)
 [ -n "$POST_UNIT_SHA" ] || rollback "cannot checksum the regenerated unit"
-journal unit "regenerated unit sha256=$POST_UNIT_SHA effective=$EFFECTIVE"
+journal unit "regenerated unit sha256=$POST_UNIT_SHA effective=$EFFECTIVE" \
+  --sha256 "$POST_UNIT_SHA" --unit-path "$UNIT"
 
 # ------------------------------------------------- phase 7: one controlled stop/start
 PHASE=restart
