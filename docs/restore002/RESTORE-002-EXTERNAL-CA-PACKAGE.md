@@ -1494,8 +1494,10 @@ copy. Nothing was restarted, and no session row was written (`mode=ro` throughou
 1. **Quiescence is still unmet on the live host** — `active_agents=3` and three sessions inside the
    120 s window. No release can proceed until those clear naturally; EXT-13 neither shortens the
    window nor suppresses the gate.
-2. **The two old-runtime gates fail closed and are not addressed here.** They require their own
-   authority; they are not baseline/candidate defects and they are not bypassable by this change.
+2. **The two old-runtime gates fail closed and are not addressed here.** ~~They require their own
+   authority; they are not baseline/candidate defects and they are not bypassable by this change.~~
+   **Corrected by §23:** both gates were failing for an environment reason, not for missing coverage;
+   the probe now records the interpreter it used and refuses to claim coverage for code it did not run.
 3. **Release authority is exhausted.** `d4a5ef0a` must not be reused and this candidate has no
    approval attached: EXT-13 carries code-correction authority only.
 4. **The host still holds the superseded candidate's staged artifacts** — launcher `4105d558…`,
@@ -1506,6 +1508,9 @@ copy. Nothing was restarted, and no session row was written (`mode=ro` throughou
    at `candidate_available`, which is the intended behaviour but is a new operational precondition.
 
 ### 22.14 Proposed replacement release command (not authorised)
+
+> **Superseded by §23:** use candidate `16a4d39a418f16ebac8eeb27ce7585158ce9e8ef` / tree
+> `3ff43dc4aed41d3cc8bbe8df527aedbd6b77466f`. The command shape is unchanged.
 
 ```
 sudo /home/hermes/work/restore002-fix/harness/hermes-release-002 bootstrap --force
@@ -1519,12 +1524,201 @@ evaluates quiescence. Any `REFUSED:` is a package defect; `NO_GO:` is an operati
 
 ---
 
+## 23. EXT-RESTORE-002-14 — the old-runtime gates, explained and corrected
+
+Authority for this section, verbatim: *“AUTHORITY: READ-ONLY INVESTIGATION, ISOLATED QUALIFICATION
+AND EVIDENCE PUBLICATION ONLY.”* Boundaries: *“NO production deployment, gateway restart or systemd
+modification.”* / *“NO admission freeze or ESTOP engagement on the live gateway.”* / *“NO manifest
+bypass, disabled gate or weakened coverage requirement.”* / *“NO recovery-hold release, protective
+drop-in removal, session mutation, Biggie modification or PR merge.”* No release authority exists
+for this candidate; nothing below was executed against the running gateway.
+
+### 23.1 What the two failing gates actually reported
+
+Both failures came from the same place: the *dynamic* half of `harness/release002_oldgate.py`.
+
+| gate | EXT-13 evidence | what it looked like | what it was |
+|---|---|---|---|
+| `old_runtime_coverage` | `UNEVALUABLE` | admission paths possibly uncovered | the probe could not run its dynamic half |
+| `old_runtime_dynamic_gates` | `interpreter failure` | drain/ESTOP gates failing | `interpreter … is missing` |
+
+The static half (AST scan of every producer's drain/ESTOP call sites) was never the problem.
+
+### 23.2 Root cause — one bad default, and one undeclared dependency
+
+1. **Wrong interpreter, by default.** `oldgate_dynamic()` resolved its interpreter to
+   `<install>/venv/bin/python`. Every qualification workspace is a `git clone` of the installation;
+   a clone has no `venv/`, so the probe exited with `interpreter … is missing` before running a
+   single gate. On the live host the same default resolves — which is why the failure was visible
+   only in qualification, not in production.
+2. **An undeclared dependency made the naive fallback wrong too.** Falling back to the probe's own
+   interpreter fails for a different reason: `gateway.drain_control` imports `utils`, which imports
+   `ruamel.yaml`, which is installed in the *deployed venv's* site-packages and nowhere else. A
+   fallback that ignores this reports FAIL — i.e. "admission paths are uncovered" — when in truth
+   no admission path was ever exercised.
+
+Neither is a fact about admission coverage. The correct output for (2) is **unevaluable**, not
+**uncovered**, because no evidence was obtained.
+
+### 23.3 The correction — an interpreter chain, a provenance gate, and an honest third answer
+
+- **Interpreter chain:** `--python` → `HERMES_RELEASE_OLDGATE_PYTHON` → `<install>/venv/bin/python`
+  → the probe's own interpreter. The resolved path, its source and `sys.version` are recorded in
+  the report (`dynamic.interpreter = {path, source, version}`) **and** appended to the
+  `old_runtime_coverage` gate detail, so an operator can re-run the exact check.
+- **Fail-closed pinning:** an explicitly supplied `--python` or `HERMES_RELEASE_OLDGATE_PYTHON` that
+  does not exist is **unevaluable**. A stale pin must never degrade into a silent fallback that
+  turns a non-running check into a green gate.
+- **Provenance gate (`interpreter_provenance`):** the probe imports `gateway.drain_control`,
+  `agent.estop` and `hermes_cli.gateway_runtime` through the chosen interpreter and requires every
+  `__file__` to resolve inside the installation tree. Coverage is never claimed for code the probe
+  did not run — so allowing an interpreter from elsewhere does not widen what can be called "covered".
+- **Import failure is unevaluable, not uncovered:** `ModuleNotFoundError`/`ImportError` in a gate
+  process now yields `ok=None`. The overall verdict is `uncovered` only if some gate returned
+  `False`, `unevaluable` if any returned `None`, `covered` only when every gate returned `True`.
+- **Exit codes unchanged:** `0` covered, `2` uncovered (NO_GO), `3` unevaluable (NO_GO), `64` usage.
+
+### 23.4 Negative and positive controls (`tests/harness/test_release002_ext14.py`, 11 cases)
+
+| control | mechanism | expected | observed |
+|---|---|---|---|
+| explicit pin missing | `--python /nonexistent` | unevaluable, never falls through | ✅ |
+| env pin missing | `HERMES_RELEASE_OLDGATE_PYTHON=/nonexistent` | unevaluable | ✅ |
+| chain order | `--python` beats env beats `<install>/venv` beats own interpreter | recorded source matches | ✅ |
+| no runtime deps | interpreter shim `python -S` (site-packages dropped) | `interpreter_provenance = None`, detail names the module | ✅ |
+| foreign code under a resolvable install | `sitecustomize` installs an `importlib.abc.MetaPathFinder` redirecting `gateway`/`agent`/`hermes_cli` to a copy outside the install | provenance FAIL, never covered | ✅ |
+| deliberately removed gate | `_runner_draining` renamed, not blanked, so the module still parses | probe reports "not referenced" | ✅ |
+| gate added later is not assumed covered | new producer call site absent from the static map | uncovered, not silently ignored | ✅ |
+| preflight reports the interpreter | `old_runtime_coverage` detail contains `interpreter={source}:{path}` | present | ✅ |
+
+The shadow control needed a meta-path finder: two `sys.path`-based variants failed to shadow an
+already-resolvable installation, which is exactly the hazard EXT-13A named. A `sys.path` test would
+have passed while proving nothing.
+
+### 23.5 Real-baseline qualification (read-only, isolated)
+
+Driver `scratch/qual14.py`: `BASE=e05128fe…`, `CAND=16a4d39a…`, disposable workspace and
+`HERMES_HOME`, stripped `PYTHONPATH`/`PYTHONHOME`, `PYTHONDONTWRITEBYTECODE=1`, `--shared
+--no-hardlinks` clone of the installation as `--install` (no `venv/`, like every qualification
+workspace), candidate commit present in the same object store as `--source`/`--repo`.
+
+```
+BOOTSTRAP      rc=0
+STAGE          rc=0   candidate 16a4d39a… tree 3ff43dc4… available to <ws>/install
+ENGINE AUDIT   rc=0   9/9
+MANIFEST PRE   rc=0   ok=true  28/28 gates, failed=[]
+PREFLIGHT      rc=2   30 gates, 28 pass, 2 fail
+PLAN           rc=2   DRY RUN RESULT: NO_GO — preflight rc=2, manifest rc=0
+```
+
+The two failing gates, verbatim:
+
+```
+recent_session_activity  active within 120s: 3 (20261101_113736_7565f3f9,
+                         20261103_111647_bd71d22f, 20261105_083311_65e056f7)
+no_active_turns          gateway_state.active_agents=3
+```
+
+Both are the live host's ordinary business — this investigation's own gateway sessions. Quiescence
+is a precondition of release, not a package defect, and neither gate was shortened or suppressed.
+
+The old-runtime gates, verbatim:
+
+```
+old_runtime_coverage      verdict=covered producers=12 uncovered=none unevaluable=none
+                          interpreter=HERMES_RELEASE_OLDGATE_PYTHON:/home/hermes/.hermes/hermes-agent/venv/bin/python (3.11.15)
+old_runtime_dynamic_gates interpreter_provenance=ok; drain_starts_clear=ok;
+                          drain_reader_refuses_when_engaged=ok; drain_reader_admits_when_cleared=ok;
+                          estop_starts_clear=ok; estop_reader_refuses_when_engaged=ok;
+                          estop_reader_admits_when_cleared=ok;
+                          client_discovery_refuses_draining_owner=ok
+```
+
+Producers proven covered, with the call sites the probe checked:
+
+```
+messaging_inbound        gateway/run_inbound.py:1319, :292
+busy_session_followup    gateway/run_inbound.py:778
+cron_dispatch            cron/scheduler_tick.py:118
+cron_misfire_replay      cron/scheduler_provider.py:308
+kanban_watchers          gateway/kanban_watchers_common.py:110
+goals_heartbeat          gateway/run_goals.py:169
+goals_loop               gateway/run_goals.py:496
+api_cron_webhook         gateway/platforms/api_server.py:3500
+runtime_api_rpc          gateway/run_api.py:387,389,415,468
+internal_wake            gateway/wake.py:106,115
+finite_cli_prompt        hermes_cli/gateway_runtime.py:98,100,103,110,121,123,127,130,133,140,142,145,146
+```
+
+`12` producer entries, each carrying every drain/ESTOP call site the static scan found in that
+producer (`messaging_inbound` appears twice — two independent admission paths). Every dynamic control
+ran in a throwaway `HERMES_HOME`; the live `/home/hermes/.hermes/ESTOP` and `.drain_request.json` were
+asserted absent before and after, and neither was ever engaged.
+
+### 23.6 Positive and negative controls against the live-shaped identities
+
+```
+positive: install=BASE, source=candidate        rc=0  ok=true   28/28, failed=[]
+negative: install pointed at the candidate      rc=2  ok=false  install_head_pre, install_tree_pre
+negative: foreign source repository             rc=2  ok=false  candidate_available, candidate_tree,
+                                                              candidate_tree_matches_install, 6 × blob:
+```
+
+The third control needs a note, because it looks like a miss and is not: pointing `--repo`/`--source`
+at the **baseline clone** verifies `ok=true`. That is correct and intended — the source repository is
+an *object store*, and identity is the manifest's pinned commit plus per-blob hashes, not the
+directory that happens to contain them. A repository without those objects fails closed
+(`candidate_available`, `candidate_tree`, every `blob:` gate), which is the control that matters.
+
+The pre-mutation revalidation path was re-read and re-exercised for residual identity contradiction:
+`preflight --phase pre` takes `--candidate` and `--source-repo`; `manifest_verify` passes
+`--repo "$SOURCE" --source "$SOURCE" --install "$INSTALL" --engine-dir "$ENGINE_ROOT"`; the
+`revalidate` block compares the installed HEAD/tree against the *baseline* expectations and the unit
+checksum against the archive, then re-runs `manifest --verify --phase pre`. No site reads candidate
+files from the installation before mutation. No contradiction found, and none is introduced by an
+interpreter chosen outside `<install>/venv`.
+
+### 23.7 Totals and identities
+
+```
+env -u PYTHONPATH /usr/bin/python3 -m pytest tests/harness -q   →  229 passed, 0 failed
+tests/harness/test_release002_ext14.py                           →   11 passed
+```
+
+| | value |
+|---|---|
+| candidate | `16a4d39a418f16ebac8eeb27ce7585158ce9e8ef` |
+| tree | `3ff43dc4aed41d3cc8bbe8df527aedbd6b77466f` |
+| baseline / install | `e05128febbc559469a5fb835a9235a543dfdfa64` / `dc05abd074c834569cf19ca89a6446d74be5c41d` |
+| superseded candidate | `48a930361347ad2f947c0af9b861d92b03338599` / `36a27c4661ab83994ab6b7fd63a71788152d7fe1` |
+| files changed | `harness/release002_oldgate.py`, `harness/release002_preflight.py`, `tests/harness/test_release002_ext14.py` |
+| host non-mutation | unit sha, gateway PID `743641`, `NRestarts=0`, no ESTOP, no drain request, install HEAD clean, repo HEAD clean |
+
+### 23.8 Remaining risks and preconditions
+
+1. **Quiescence** — release still requires `active_agents=0` and no session inside 120 s. EXT-14
+   changes nothing about that; on this host the investigation's own sessions block it.
+2. **A pinned interpreter is a dependency precondition.** `HERMES_RELEASE_OLDGATE_PYTHON` must point
+   at an interpreter that can import the runtime's dependencies. If it cannot, the probe says
+   `unevaluable` and PLAN says NO_GO — it does not say "covered", and it does not fall through to a
+   different interpreter.
+3. **The probe runs runtime code, not just reads it.** Coverage is claimed only for modules whose
+   `__file__` resolves inside the installation; a `sitecustomize`-style injection is caught by the
+   provenance gate, but the gate's evidence is the probe's own report — it is not an independent
+   sandbox.
+4. **Host artifacts are still superseded** — launcher `4105d558…`, `manifest.json` `3d2f60cd…`,
+   `engine/d4a5ef0a038b/`. A future attempt must `bootstrap` and `stage` from `16a4d39a`, not reuse them.
+5. **No release authority.** This candidate carries code-correction authority only; §22.14's command
+   is illustrative and is not authorised.
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
-   `48a930361347ad2f947c0af9b861d92b03338599` / tree `36a27c4661ab83994ab6b7fd63a71788152d7fe1`
-   (EXT-13; no release is requested until the External CA has reviewed §22),
+   `16a4d39a418f16ebac8eeb27ce7585158ce9e8ef` / tree `3ff43dc4aed41d3cc8bbe8df527aedbd6b77466f`
+   (EXT-14; no release is requested until the External CA has reviewed §22 and §23),
    retaining both drop-ins and the recovery hold. The superseded candidate `7596026a` / `7e6042d7`
    must not be reused: its release authority was exhausted by the 2026-11-04 `STOPPED_SAFE` attempt
    and does not transfer.
