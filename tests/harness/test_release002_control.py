@@ -117,8 +117,12 @@ def verify(stage_dict, **overrides):
         for part in parts[:-1]:
             node = node[part]
         node[parts[-1]] = value
+    # EXT-13B: the staged engine directory is a third identity, named explicitly. In this fixture the
+    # staged bytes are the candidate worktree itself.
     return ctrl.verify_manifest(manifest, repo=stage_dict["repo"], install=stage_dict["install"],
-                                launcher=stage_dict["launcher"], phase=stage_dict.get("phase", "pre"))
+                                launcher=stage_dict["launcher"], phase=stage_dict.get("phase", "pre"),
+                                source=stage_dict["repo"],
+                                engine_dir=stage_dict.get("engine_dir", stage_dict["repo"]))
 
 
 def test_manifest_roundtrip_is_green(stage):
@@ -140,9 +144,22 @@ def test_every_manifest_gate_is_evaluated_and_named(stage):
     assert result["ok"] == (result["failed"] == [])
 
 
-def test_uncommitted_worktree_edit_fails_closed(stage):
+def test_uncommitted_edit_of_the_staged_bytes_fails_closed_pre(stage):
+    # Pre deployment the installed worktree is the *baseline*: it legitimately lacks candidate files.
+    # What must match is the staged engine, so an edit there is what the pre phase refuses (EXT-13B).
     (stage["repo"] / ENGINE_FILES[0]).write_text("# edited after the candidate commit\n", encoding="utf-8")
     result = verify(stage)
+    assert result["ok"] is False
+    assert f"staged_file_bytes:{ENGINE_FILES[0]}" in result["failed"]
+
+
+def test_uncommitted_edit_of_the_deployed_file_fails_closed_post(stage):
+    # After the deploy the same check runs against the installation, which must hold the pinned bytes.
+    (stage["install"] / ENGINE_FILES[0]).write_text("# edited after the deploy\n", encoding="utf-8")
+    result = ctrl.verify_manifest(dict(stage)["manifest"], repo=stage["repo"], install=stage["install"],
+                                  launcher=stage["launcher"], phase="post",
+                                  expected_post_unit_sha256="0" * 64,
+                                  source=stage["repo"], engine_dir=stage["repo"])
     assert result["ok"] is False
     assert f"worktree_matches_candidate:{ENGINE_FILES[0]}" in result["failed"]
 

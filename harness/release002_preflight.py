@@ -20,7 +20,10 @@ Exit codes: 0 = every gate green (a release may be proposed), 2 = at least one g
 3 = a gate could not be evaluated (treated as failed — fail closed).
 
 Every check is a read: ``git`` in the live install, ``systemctl show/cat``, the journal, ``/proc``,
-and a read-only SQLite session inventory. Nothing is written except the optional ``--json`` file.
+and a read-only SQLite session inventory. The inventory's classifier is loaded from the *candidate's
+pinned git blob* (``gateway/session_resume_plan.py``), never imported from whichever gateway is
+installed — the baseline predates that module (EXT-13A). Nothing is written except the optional
+``--json`` file.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from release002_oldgate import oldgate_report  # noqa: E402  (probe of the deployed runtime)
+import release002_control  # noqa: E402  (pinned-blob loader; EXT-13A)
 
 # The engine exports HERMES_RELEASE_INSTALL / HERMES_RELEASE_HOME; the defaults are the live host.
 HERMES_HOME = os.environ.get("HERMES_RELEASE_HOME") or "/home/hermes/.hermes"
@@ -219,22 +223,48 @@ def journal_since(boot_offset: str = "today") -> str:
     return out if rc == 0 else ""
 
 
-def session_state(quiet_window_s: float = QUIET_WINDOW_S) -> dict:
-    """Read-only session inventory: open rows, planner buckets, and recent activity."""
-    try:
-        from gateway.session_resume_plan import classify, load_facts
-    except Exception as exc:  # pragma: no cover - import failure is itself a finding
-        return {"error": f"cannot import planner: {exc}"}
+PLANNER_PATH = "gateway/session_resume_plan.py"
+
+
+def session_state(quiet_window_s: float = QUIET_WINDOW_S, *, candidate: str | None = None,
+                  source_repo: str | None = None) -> dict:
+    """Read-only session inventory measured with the *candidate's pinned* planner (EXT-13A).
+
+    ``gateway/session_resume_plan.py`` arrives with this release, so it does not exist in the
+    installed baseline: importing ``gateway.session_resume_plan`` would resolve against whichever
+    gateway happens to be installed and fail (which is exactly what refused the second production
+    attempt). Instead the classifier is loaded from the candidate's own git blob via
+    :func:`release002_control.load_pinned_module` — content-addressed, worktree independent, and
+    identical before and after deployment. Nothing is imported from the installation, no ambient
+    ``PYTHONPATH`` or virtualenv is consulted, and ``sys.path`` is not extended.
+
+    Every failure (absent candidate, missing blob, a module that will not compile or lacks
+    ``load_facts``/``classify``, an unreadable store, malformed rows) returns ``{"error": ...}`` so
+    the caller records an *unevaluable* gate and the release fails closed. The store itself is only
+    ever opened read-only, by the planner's own ``mode=ro`` connection.
+    """
+    repo = source_repo or INSTALL
+    if not candidate:
+        return {"error": "no candidate supplied: the session inventory must be measured with the "
+                         "candidate's pinned planner, never with an installed import"}
+    pin = release002_control.load_pinned_module(repo, candidate, PLANNER_PATH)
+    evidence = {k: pin.get(k) for k in ("path", "commit", "blob", "sha256", "repo") if pin.get(k)}
+    if not pin.get("ok"):
+        return {"error": f"pinned planner unavailable: {pin.get('error')}", "planner": evidence}
+    planner = pin["module"]
     now = time.time()
-    facts = load_facts(DB, INDEX)
-    buckets = classify(facts, now=now)
-    open_facts = [f for f in facts if f.ended_at is None]
-    fingerprint = hashlib.sha256(
-        "\n".join(
-            f"{f.session_id}|{f.started_at}|{f.message_count}|{f.ended_at}"
-            for f in sorted(open_facts, key=lambda f: f.session_id)
-        ).encode()
-    ).hexdigest()
+    try:
+        facts = planner.load_facts(DB, INDEX)
+        buckets = planner.classify(facts, now=now)
+        open_facts = [f for f in facts if f.ended_at is None]
+        fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{f.session_id}|{f.started_at}|{f.message_count}|{f.ended_at}"
+                for f in sorted(open_facts, key=lambda f: f.session_id)
+            ).encode()
+        ).hexdigest()
+    except Exception as exc:  # noqa: BLE001 - any failure here is a fail-closed signal
+        return {"error": f"pinned planner failed: {type(exc).__name__}: {exc}", "planner": evidence}
     recent = [f.session_id for f in open_facts if (f.last_ts or 0.0) >= now - quiet_window_s]
     return {
         "open": len(open_facts),
@@ -243,6 +273,8 @@ def session_state(quiet_window_s: float = QUIET_WINDOW_S) -> dict:
         "empty_open": sum(1 for f in open_facts if f.message_count == 0),
         "recently_active": recent,
         "quiet_window_s": quiet_window_s,
+        "planner": evidence,
+        "planner_source": "pinned-candidate-blob",
     }
 
 
@@ -303,6 +335,9 @@ def main() -> int:
     ap.add_argument("--expect-tree", default=DEFAULT_INSTALL_TREE)
     ap.add_argument("--candidate", default=None,
                     help="commit SHA the release will deploy (checked for presence and ancestry)")
+    ap.add_argument("--source-repo", dest="source_repo", default=None,
+                    help="repository holding the candidate (default: the installation); the pinned "
+                         "session planner is read from this repo's git objects, never from an import")
     ap.add_argument("--quiet-window", type=float, default=QUIET_WINDOW_S)
     ap.add_argument("--phase", choices=["pre", "post", "released", "any"], default="pre",
                     help="pre = before any mutation (gateway running); post = after the restart, "
@@ -418,14 +453,17 @@ def main() -> int:
     # A session store that cannot be read is *unevaluable*, never a crash: a traceback would emit no
     # JSON at all and the engine would have to guess what happened.
     try:
-        state = session_state(args.quiet_window)
+        state: dict = session_state(args.quiet_window, candidate=args.candidate,
+                                    source_repo=args.source_repo)
     except Exception as exc:  # noqa: BLE001 - any failure here is a fail-closed signal
         state = {"error": f"session state unreadable: {type(exc).__name__}: {exc}"}
     if "error" in state:
         g.add("session_inventory", None, state["error"])
     else:
+        planner = state.get("planner") or {}
         g.add("session_inventory", state["open"] > 0,
-              f"open={state['open']} counts={state['counts']} empty={state['empty_open']}")
+              f"open={state['open']} counts={state['counts']} empty={state['empty_open']} "
+              f"planner={state.get('planner_source')}:{(planner.get('sha256') or '')[:12]}")
         # Informational: parallel threads legitimately hold recent timestamps. The *runner* is what
         # enforces quiescence, by waiting for gateway_state.active_agents to reach 0 before it stops.
         g.add("recent_session_activity", not state["recently_active"],

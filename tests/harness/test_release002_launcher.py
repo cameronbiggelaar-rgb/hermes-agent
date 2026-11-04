@@ -277,20 +277,43 @@ sys.exit(2)
 """
 
 
-def test_engine_plan_reaches_go_without_touching_anything(world):
+def test_engine_plan_never_reports_go_when_the_manifest_fails(world):
+    """EXT-13C: a passing preflight must not launder a failing manifest into GO."""
     stage = _staged_engine(world["base"], GO_PREFLIGHT)
     archive = world["base"] / "archive"
-    proc = world["run"](["bash", stage / "harness" / "release002_release.sh", "--plan",
-                         "--candidate", world["candidate"], "--archive", archive],
-                        cwd=stage)
-    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-2000:])
-    assert "DRY RUN RESULT: GO" in proc.stdout
-    assert "merge --ff-only" in proc.stdout
+    manifest = world["write_manifest"]()
+    manifest["pre_release"]["unit"]["sha256"] = "0" * 64
+    path = world["lib"] / "manifest.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    env = dict(world["env"], HERMES_RELEASE_MANIFEST=str(path),
+               HERMES_RELEASE_LAUNCHER=str(world["launcher"]))
+    proc = subprocess.run(["bash", str(stage / "harness" / "release002_release.sh"), "--plan",
+                           "--candidate", world["candidate"], "--archive", str(archive)],
+                          capture_output=True, text=True, env=env, cwd=str(stage), timeout=300)
+    assert proc.returncode == 2, (proc.stdout[-2000:], proc.stderr[-2000:])
+    assert "DRY RUN RESULT: NO_GO" in proc.stdout
+    assert "manifest rc=2" in proc.stdout
+    assert "preflight verdict GO" in proc.stdout          # preflight really did pass
+    assert "DRY RUN RESULT: GO" not in proc.stdout
     assert git(world["install"], "rev-parse", "HEAD") == world["deployed"]
     assert git(world["install"], "status", "--porcelain") == ""
     assert not (world["base"] / "var" / "journal.json").exists()
-    assert not (world["env"]["HERMES_HOME"] and (Path(world["env"]["HERMES_HOME"]) / "ESTOP").exists())
+    assert not (Path(world["env"]["HERMES_HOME"]) / "ESTOP").exists()
     assert not list(Path(world["env"]["HERMES_HOME"]).glob("**/*drain*"))
+
+
+def test_engine_plan_reports_unevaluable_when_the_manifest_is_unreadable(world):
+    """EXT-13C: an unreadable manifest is UNEVALUABLE, not a passing gate."""
+    stage = _staged_engine(world["base"], GO_PREFLIGHT)
+    archive = world["base"] / "archive-missing"
+    archive.mkdir()
+    env = dict(world["env"], HERMES_RELEASE_MANIFEST=str(world["base"] / "absent-manifest.json"))
+    proc = subprocess.run(["bash", str(stage / "harness" / "release002_release.sh"), "--plan",
+                           "--candidate", world["candidate"], "--archive", str(archive)],
+                          capture_output=True, text=True, env=env, cwd=str(stage), timeout=300)
+    assert proc.returncode == 3, (proc.stdout[-2000:], proc.stderr[-2000:])
+    assert "DRY RUN RESULT: UNEVALUABLE" in proc.stdout
+    assert "DRY RUN RESULT: GO" not in proc.stdout
 
 
 def test_engine_plan_still_prints_the_runbook_when_the_host_is_busy(world):

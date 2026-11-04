@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -162,6 +163,75 @@ def blob_sha256(repo: str | Path, commit: str, path: str) -> Optional[str]:
     if proc.returncode != 0:
         return None
     return hashlib.sha256(proc.stdout).hexdigest()
+
+
+def blob_bytes(repo: str | Path, commit: str, path: str) -> Optional[bytes]:
+    """Raw bytes of a file *at* a commit, or None when the object is absent."""
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}"],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - environment
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def load_pinned_module(repo: str | Path, commit: str, path: str, *,
+                       name: str = "hermes_release_pinned_module",
+                       required: "tuple[str, ...]" = ("load_facts", "classify")) -> dict[str, Any]:
+    """Load one module from a pinned candidate blob — never from an installed import (EXT-13A).
+
+    The pre-release session inventory needs implementation code that the *baseline* installation
+    does not have: ``gateway/session_resume_plan.py`` arrives with this release, so importing
+    ``gateway.session_resume_plan`` resolves against whichever gateway happens to be installed (the
+    baseline) and fails. This loader is the deterministic alternative:
+
+    * the bytes come from ``<commit>:<path>`` in a named repository — content-addressed, worktree
+      independent, and identical before and after deployment (so pre/post inventories use exactly
+      the same classifier and cannot disagree by construction);
+    * nothing is written into the installation, no ``sys.path`` entry is consulted for the module,
+      and ambient ``PYTHONPATH`` / virtualenv resolution plays no part;
+    * the module is executed into a private namespace object, never inserted in ``sys.modules``;
+    * every failure is returned as ``{"ok": False, "error": ...}`` so callers fail closed instead of
+      falling back to an installed copy.
+
+    ``required`` names the attributes the caller needs; a module missing any of them is refused.
+    The digest/blob identity of the loaded bytes is returned as evidence.
+    """
+    commit = (commit or "").strip().lower()
+    if not (len(commit) == 40 and all(c in "0123456789abcdef" for c in commit)):
+        return {"ok": False, "error": f"candidate {commit!r} is not a 40-hex commit"}
+    parts = Path(path).parts
+    if not parts or Path(path).is_absolute() or ".." in parts:
+        return {"ok": False, "error": f"unsafe module path {path!r}"}
+    code, blob_id = _git(repo, "rev-parse", "--verify", "--quiet", f"{commit}:{path}")
+    if code != 0 or not blob_id:
+        return {"ok": False, "error": f"{path} is absent at {commit} in {repo}"}
+    src = blob_bytes(repo, commit, path)
+    if src is None:
+        return {"ok": False, "error": f"{path} could not be read at {commit} in {repo}"}
+    digest = hashlib.sha256(src).hexdigest()
+    evidence = {"path": path, "commit": commit, "blob": blob_id, "sha256": digest,
+                "repo": str(repo), "bytes": len(src)}
+    # A pinned module may itself use features that resolve the defining module by name -- the
+    # candidate planner declares ``@dataclass`` types, and dataclasses looks the class's module up
+    # in ``sys.modules`` while the class is being created. So the module is registered under a
+    # content-addressed key for the duration of the exec and removed again afterwards: resolvable,
+    # never importable from a path, never left behind, and a reload of the same bytes is identical.
+    key = f"{name}_{digest[:16]}"
+    module = types.ModuleType(key)
+    module.__file__ = f"{commit}:{path}"
+    module.__dict__["__pinned__"] = evidence
+    try:
+        sys.modules[key] = module
+        exec(compile(src, module.__file__, "exec"), module.__dict__)
+    except Exception as exc:  # noqa: BLE001 - a broken pinned module must be unevaluable, not fatal
+        return {"ok": False, "error": f"pinned {path} failed to load: {exc}", **evidence}
+    finally:
+        sys.modules.pop(key, None)
+    missing = [attr for attr in required if not hasattr(module, attr)]
+    if missing:
+        return {"ok": False, "error": f"pinned {path} lacks {','.join(missing)}", **evidence}
+    return {"ok": True, "module": module, **evidence}
 
 
 # --------------------------------------------------------------------------- manifest
@@ -334,15 +404,29 @@ def audit_engine(manifest: dict[str, Any], *, engine_dir: str | Path) -> dict[st
 
 def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str | Path,
                     launcher: str | Path, phase: str = "pre",
-                    expected_post_unit_sha256: Optional[str] = None) -> dict[str, Any]:
-    """Fail-closed verification of the pinned identities, selected by release phase (EXT-07).
+                    expected_post_unit_sha256: Optional[str] = None,
+                    source: Optional[str | Path] = None,
+                    engine_dir: Optional[str | Path] = None) -> dict[str, Any]:
+    """Fail-closed verification of the pinned identities, selected by release phase (EXT-07/13B).
 
-    ``phase="pre"``  — before any mutation: the install must still be the pre-release identity and
-    the unit must still be the archived bytes.
-    ``phase="post"`` — after the restart: the install must now be the *candidate* identity, the unit
-    must be the regenerated one (``TimeoutStopSec`` at the computed value **and** a valid journaled
-    64-hex checksum matching the file's actual bytes), and the drop-ins must be byte-identical to the
-    staged ones. The checksum is mandatory here: passing ``None`` is a failed gate, not a skip.
+    Three identities are distinct and must never be conflated:
+
+    * **installed baseline** — ``install``: exact pre-release HEAD/tree, clean worktree, archived
+      unit and drop-ins (``phase="pre"``), or the candidate identity afterwards.
+    * **candidate** — ``source`` (defaults to ``repo``): the repository that holds the candidate
+      commit. Candidate objects, trees and blobs are read *from git*, never from a worktree.
+    * **staged execution engine** — ``engine_dir``: the exact files and bytes approved for release.
+
+    ``phase="pre"``  — before any mutation: the install must still be the pre-release identity, the
+    unit must still be the archived bytes, the candidate blobs must match the pinned digests, and
+    the *staged engine* must be byte-identical to those pins. It never demands that candidate files
+    already exist in the old installed worktree (EXT-13B: the baseline predates files this release
+    introduces), so ``engine_dir`` is mandatory here.
+    ``phase="post"`` — after the restart: the install must now be the *candidate* identity, its
+    worktree must hold the pinned bytes, the unit must be the regenerated one (``TimeoutStopSec``
+    at the computed value **and** a valid journaled 64-hex checksum matching the file's actual
+    bytes), and the drop-ins must be byte-identical to the staged ones. The checksum is mandatory
+    here: passing ``None`` is a failed gate, not a skip.
     ``phase="released"`` — the independent post-release check: the same candidate identity set as
     ``post`` (candidate HEAD/tree, regenerated unit, both retained drop-ins), named with a
     ``released`` label so it can be driven without re-entering the freeze.
@@ -352,6 +436,7 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     evaluated (a missing file is a failure, never a skip).
     """
     gates: list[dict[str, Any]] = []
+    src = Path(source) if source else Path(repo)
 
     def gate(name: str, ok: Optional[bool], detail: str = "") -> None:
         gates.append({"gate": name, "ok": bool(ok), "detail": detail})
@@ -365,24 +450,51 @@ def verify_manifest(manifest: dict[str, Any], *, repo: str | Path, install: str 
     cand = manifest.get("candidate_commit") or ""
     gate("schema", manifest.get("schema") == MANIFEST_SCHEMA, f"schema={manifest.get('schema')!r}")
     gate("candidate_commit_shape", len(cand) == 40 and all(c in "0123456789abcdef" for c in cand), cand)
-    present = object_present(repo, cand) and object_present(install, cand)
-    gate("candidate_available", present, f"repo={object_present(repo, cand)} install={object_present(install, cand)}")
+    present = object_present(src, cand) and object_present(install, cand)
+    gate("candidate_available", present,
+         f"source={object_present(src, cand)} install={object_present(install, cand)}")
     if present:
-        gate("candidate_tree", object_tree(repo, cand) == manifest.get("candidate_tree"),
-             f"manifest={manifest.get('candidate_tree')} observed={object_tree(repo, cand)}")
+        gate("candidate_tree", object_tree(src, cand) == manifest.get("candidate_tree"),
+             f"manifest={manifest.get('candidate_tree')} observed={object_tree(src, cand)}")
         gate("candidate_tree_matches_install", object_tree(install, cand) == manifest.get("candidate_tree"),
              f"install={object_tree(install, cand)}")
     else:
         gate("candidate_tree", False, "candidate absent")
         gate("candidate_tree_matches_install", False, "candidate absent")
 
-    for path, pinned in (manifest.get("engine") or {}).items():
+    engine_map = manifest.get("engine") or {}
+    for path, pinned in engine_map.items():
         want = (pinned or {}).get("blob_sha256")
-        got = blob_sha256(repo, cand, path) if present else None
+        got = blob_sha256(src, cand, path) if present else None
         gate(f"blob:{path}", bool(want) and got == want, f"pinned={want} observed={got}")
-        on_disk = sha256_file(Path(repo) / path)
-        gate(f"worktree_matches_candidate:{path}", on_disk == got,
-             "worktree file differs from the pinned blob" if on_disk != got else "")
+
+    if phase in {"post", "released"}:
+        # The deployed installation must now hold the pinned bytes: this is the check that proves
+        # the release installed the candidate and not something else.
+        for path in engine_map:
+            if path == LAUNCHER_REL:
+                continue  # installed to $LIB, not into the install worktree (launcher gates below)
+            want = (engine_map[path] or {}).get("blob_sha256")
+            got = blob_sha256(src, cand, path) if present else None
+            on_disk = sha256_file(Path(install) / path)
+            gate(f"worktree_matches_candidate:{path}", on_disk == got,
+                 "worktree file differs from the pinned blob" if on_disk != got else "")
+    elif phase == "pre":
+        # EXT-13B: pre verifies the *staged engine*, not the old installation's worktree. The
+        # baseline predates files this release introduces, so demanding candidate bytes there would
+        # refuse every correct release; demanding them here proves exactly what will execute.
+        eng = Path(engine_dir) if engine_dir else None
+        gate("staged_engine_dir_supplied", eng is not None, str(eng) if eng else "<none>")
+        gate("staged_engine_dir_present", bool(eng and eng.is_dir()), str(eng) if eng else "<none>")
+        for path in engine_map:
+            if path == LAUNCHER_REL:
+                # The launcher is not part of the engine directory: it runs from $LIB and its own
+                # identity is proved by the launcher_sha256 / launcher_path gates below.
+                continue
+            want = (engine_map[path] or {}).get("blob_sha256")
+            got = sha256_file(eng / path) if eng else None
+            gate(f"staged_file_bytes:{path}", bool(want) and got == want,
+                 f"pinned={want} observed={got}")
 
     want_launcher = (manifest.get("launcher") or {}).get("sha256")
     gate("launcher_sha256", sha256_file(launcher) == want_launcher and bool(want_launcher),
@@ -918,6 +1030,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     m.add_argument("--unit", default="/etc/systemd/system/hermes-gateway.service")
     m.add_argument("--phase", default="pre", choices=["pre", "post", "released", "any"],
                    help="which pinned identity set to verify (EXT-07)")
+    m.add_argument("--source", default=None,
+                   help="candidate source repository for git object/blob reads (default: --repo)")
+    m.add_argument("--engine-dir", dest="engine_dir", default=None,
+                   help="staged engine directory; mandatory for --phase pre (EXT-13B)")
     m.add_argument("--expected-post-unit-sha256", dest="expected_post_unit_sha256", default=None,
                    help="journaled checksum of the regenerated unit, when the caller has it")
 
@@ -1067,7 +1183,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _emit({"ok": False, "failed": ["manifest_unreadable"]}, 3)
         report = verify_manifest(manifest, repo=args.repo, install=args.install, launcher=args.launcher,
                                  phase=args.phase,
-                                 expected_post_unit_sha256=args.expected_post_unit_sha256)
+                                 expected_post_unit_sha256=args.expected_post_unit_sha256,
+                                 source=args.source, engine_dir=args.engine_dir)
         return _emit(report, 0 if report["ok"] else 2)
 
     if args.cmd == "engine-files":

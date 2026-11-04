@@ -227,7 +227,8 @@ class TestSeparatePrePostIdentities:
     def test_pre_phase_passes_before_mutation(self, tmp_path):
         repo, base, cand, inst, unit = self._fixture(tmp_path)
         m = self._manifest(repo, base, cand, inst, unit)
-        rep = ctl.verify_manifest(m, repo=repo, install=inst, launcher=repo / LAUNCHER, phase="pre")
+        rep = ctl.verify_manifest(m, repo=repo, install=inst, launcher=repo / LAUNCHER, phase="pre",
+                                  source=repo, engine_dir=repo)
         assert rep["ok"] is True, rep["failed"]
         assert rep["phase"] == "pre"
 

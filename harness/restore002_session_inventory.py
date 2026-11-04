@@ -1,11 +1,19 @@
 """Read-only inventory of open session records, including the eight unresolved ones.
 
 Run:
-    env -u PYTHONPATH /usr/bin/python3.13 harness/restore002_session_inventory.py [--json PATH]
+    env -u PYTHONPATH /usr/bin/python3.13 harness/restore002_session_inventory.py \\
+        --candidate <40-hex> [--source-repo PATH] [--json PATH]
 
-Classification is *not* reimplemented here: it calls ``gateway.session_resume_plan.load_facts`` and
-``classify`` so the inventory and the planner can never disagree. Opens state.db with mode=ro and
-``PRAGMA query_only=1``; the only write is the optional ``--json`` file.
+Classification is *not* reimplemented here: it calls the candidate's own ``load_facts`` and
+``classify`` so the inventory and the planner can never disagree — and so a pre-deployment inventory
+works when the installation predates ``gateway/session_resume_plan.py`` (EXT-13A). The module is
+loaded from the pinned candidate blob by :func:`release002_control.load_pinned_module`; nothing is
+imported from the installed gateway, no ``PYTHONPATH`` entry is consulted and ``sys.path`` is not
+extended for it. ``--candidate`` is mandatory unless ``--allow-unpinned-planner`` is passed (a
+developer convenience that production callers never use and that is labelled in the output).
+
+The store is opened by the planner with ``mode=ro`` and ``PRAGMA query_only=1``; the only write is
+the optional ``--json`` file.
 """
 
 from __future__ import annotations
@@ -17,26 +25,76 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 
-from gateway.session_resume_plan import (  # noqa: E402  (path bootstrap must run first)
-    ACTIVE, HUMAN, OBSOLETE, RESUMABLE, classify, load_facts,
-)
+import release002_control  # noqa: E402  (pinned-blob loader; no gateway import)
+
+PLANNER_PATH = "gateway/session_resume_plan.py"
 
 DB = "/home/hermes/.hermes/state.db"
 INDEX = "/home/hermes/.hermes/sessions/sessions.json"
 
 
+def _planner(candidate: str | None, source_repo: str, *, allow_unpinned: bool = False) -> dict:
+    """Pinned planner module + its identity evidence, or ``{"error": ...}`` (fail closed)."""
+    if not candidate:
+        if not allow_unpinned:  # pragma: no cover - guarded by argparse
+            return {"error": "no --candidate: refusing to fall back to an installed planner"}
+        try:
+            from gateway.session_resume_plan import classify, load_facts
+        except Exception as exc:  # noqa: BLE001 - explicit, labelled developer fallback
+            return {"error": f"unpinned planner unavailable: {exc}"}
+        return {"ok": True, "source": "unpinned-installed-import",
+                "module": type("_P", (), {"classify": staticmethod(classify),
+                                          "load_facts": staticmethod(load_facts)})()}
+    pin = release002_control.load_pinned_module(source_repo, candidate, PLANNER_PATH,
+                                                required=("classify", "load_facts"))
+    if not pin.get("ok"):
+        return {"error": f"pinned planner unavailable: {pin.get('error')}"}
+    return {"ok": True, "source": "pinned-candidate-blob", "module": pin["module"],
+            "path": pin["path"], "commit": pin["commit"], "blob": pin["blob"],
+            "sha256": pin["sha256"], "repo": pin["repo"]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", dest="json_path", default=None)
+    ap.add_argument("--candidate", default=None,
+                    help="candidate commit whose gateway/session_resume_plan.py classifies the inventory")
+    ap.add_argument("--source-repo", dest="source_repo", default=None,
+                    help="repository holding --candidate (default: this harness's parent repository)")
+    ap.add_argument("--allow-unpinned-planner", dest="allow_unpinned", action="store_true",
+                    help="developer dry runs only: import the *installed* planner (production never "
+                         "passes this; the output is labelled unpinned-installed-import)")
+    ap.add_argument("--store", default=DB,
+                    help=f"session database to read (default: {DB}); opened read-only, never written")
+    ap.add_argument("--index", default=INDEX,
+                    help=f"session index JSON (default: {INDEX}); read-only, absent is tolerated")
     ap.add_argument("--summary", action="store_true",
                     help="record bucket counts and per-bucket id digests instead of the full id lists")
     args = ap.parse_args()
 
+    source_repo = args.source_repo or os.path.dirname(os.path.dirname(_HERE))
+    pin = _planner(args.candidate, source_repo, allow_unpinned=args.allow_unpinned)
+    if not pin.get("ok"):
+        print(json.dumps({"ok": False, "failed": ["session_planner"], "error": pin["error"]}, indent=2))
+        return 2
+    planner = pin["module"]
+    classify, load_facts = planner.classify, planner.load_facts
+    ACTIVE = getattr(planner, "ACTIVE", "active")
+    HUMAN = getattr(planner, "HUMAN", "human")
+    OBSOLETE = getattr(planner, "OBSOLETE", "obsolete")
+    RESUMABLE = getattr(planner, "RESUMABLE", "resumable")
+
     now = time.time()
-    facts = load_facts(DB, INDEX)
-    buckets = classify(facts, now=now)
+    try:
+        facts = load_facts(args.store, args.index)
+        buckets = classify(facts, now=now)
+    except Exception as exc:  # noqa: BLE001 - unreadable/malformed store is a fail-closed result
+        print(json.dumps({"ok": False, "failed": ["session_store"],
+                          "error": f"{type(exc).__name__}: {exc}"}, indent=2))
+        return 2
     open_facts = [f for f in facts if f.ended_at is None]
     # The unresolved set the owner asked to preserve: open rows that carry no work at all.
     empty = [f for f in open_facts if f.message_count == 0]
@@ -51,8 +109,10 @@ def main() -> int:
 
     payload = {
         "generated_at_epoch": now,
-        "database": DB,
-        "session_index": INDEX,
+        "database": args.store,
+        "session_index": args.index,
+        "planner_source": pin["source"],
+        "planner": {k: pin[k] for k in ("path", "commit", "blob", "sha256", "repo") if k in pin},
         "open_sessions": len(open_facts),
         "open_sessions_fingerprint_sha256": fingerprint,
         "counts": {k: len(v) for k, v in buckets.items()},

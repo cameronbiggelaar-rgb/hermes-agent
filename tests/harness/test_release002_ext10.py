@@ -90,7 +90,8 @@ def install_clone(tmp_path: Path, repo: Path) -> Path:
 def _verify(mpath, repo, inst, launcher, cand, phase, expected_sha=None):
     args = [PY3, str(HARNESS / "release002_control.py"), "manifest", "--verify",
             "--phase", phase, "--path", str(mpath), "--repo", str(repo),
-            "--install", str(inst), "--launcher", str(launcher), "--candidate", cand]
+            "--install", str(inst), "--launcher", str(launcher), "--candidate", cand,
+            "--engine-dir", str(repo), "--source", str(repo)]
     if expected_sha:
         args += ["--expected-post-unit-sha256", expected_sha]
     return run(args)

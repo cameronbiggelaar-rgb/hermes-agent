@@ -19,6 +19,12 @@
 set -euo pipefail
 
 INSTALL=${HERMES_RELEASE_INSTALL:-/home/hermes/.hermes/hermes-agent}
+# EXT-13B: three distinct identities. $INSTALL is the *installed* tree — the preserved RESTORE-001
+# baseline before the deploy and the candidate afterwards. $SOURCE is the repository that holds the
+# candidate commit; pre-release manifest checks read candidate objects/blobs from git there, because
+# the baseline predates files this release introduces. $ENGINE_DIR is the staged execution engine.
+SOURCE=${HERMES_RELEASE_SOURCE:-$INSTALL}
+export HERMES_RELEASE_SOURCE="$SOURCE"
 SERVICE=hermes-gateway.service
 # The unit path is the production systemd path, always. The isolated qualification harness may point
 # it at a temporary unit, but only with the explicit flag below, so no environment can silently
@@ -39,6 +45,10 @@ ESTOP_FILE=$HHOME/ESTOP
 LOCK=/var/lib/hermes-release/restore-002.lock
 JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
 ENGINE_DIR=$(cd "$(dirname "$0")" && pwd)
+# The manifest's engine keys are "harness/<file>" relative to the staged engine root; $ENGINE_DIR is
+# this script's own directory, so --engine-dir must name the parent or every staged_file_bytes gate
+# would look for harness/harness/<file> (EXT-13B).
+ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=$INSTALL/venv/bin/python
 PY3=/usr/bin/python3.13
 EXPECT_HEAD=${EXPECT_HEAD:-e05128febbc559469a5fb835a9235a543dfdfa64}
@@ -158,10 +168,10 @@ preflight() { # $1=phase  [$2=head $3=tree] -> prints JSON, exit 0 only when eve
   case "$1" in
     pre)  "$PY" "$ENGINE_DIR/release002_preflight.py" --phase pre \
             --expect-head "${2:-$EXPECT_HEAD}" --expect-tree "${3:-$EXPECT_TREE}" \
-            --candidate "$CANDIDATE" ;;
+            --candidate "$CANDIDATE" --source-repo "$SOURCE" ;;
     post|released)
           "$PY" "$ENGINE_DIR/release002_preflight.py" --phase "$1" --candidate "$CANDIDATE" \
-            --expect-head "$CANDIDATE" --expect-tree "$CAND_TREE" ;;
+            --expect-head "$CANDIDATE" --expect-tree "$CAND_TREE" --source-repo "$SOURCE" ;;
     *)    echo "preflight: unknown phase '$1'" >&2; return 64 ;;
   esac
 }
@@ -178,15 +188,18 @@ manifest_verify() { # $1=phase [$2=expected post unit sha256] -> prints JSON; 0 
       fi ;;
   esac
   if [ ! -f "$MANIFEST" ]; then
-    warn "no release manifest at $MANIFEST"
-    return 1
+    # Missing manifest is *unevaluable*, not a failed gate: 3 keeps it distinguishable from rc 2 in
+    # the PLAN decision and preserves fail-closed behaviour (EXT-13C).
+    warn "no release manifest at $MANIFEST — manifest verification is unevaluable"
+    return 3
   fi
   if [ -n "$expected" ]; then
-    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$INSTALL" \
-      --install "$INSTALL" --launcher "$LAUNCHER" --expected-post-unit-sha256 "$expected"
+    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$SOURCE" --source "$SOURCE" \
+      --engine-dir "$ENGINE_ROOT" --install "$INSTALL" --launcher "$LAUNCHER" \
+      --expected-post-unit-sha256 "$expected"
   else
-    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$INSTALL" \
-      --install "$INSTALL" --launcher "$LAUNCHER"
+    ct manifest --verify --phase "$phase" --path "$MANIFEST" --repo "$SOURCE" --source "$SOURCE" \
+      --engine-dir "$ENGINE_ROOT" --install "$INSTALL" --launcher "$LAUNCHER"
   fi
 }
 
@@ -415,7 +428,8 @@ if [ "$MODE" = recover ]; then
     unfreeze) FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0); freeze_release "recovery: $REASON"; exit 0 ;;
     rollback) MUTATED=1; rollback "recovery: $REASON" ;;
     complete_verification)
-      "$PY" "$ENGINE_DIR/restore002_session_inventory.py" --json "$ARCHIVE/sessions-after.json" >/dev/null 2>&1 || true
+      "$PY" "$ENGINE_DIR/restore002_session_inventory.py" --candidate "$CANDIDATE" --source-repo "$SOURCE" \
+        --json "$ARCHIVE/sessions-after.json" >/dev/null 2>&1 || true
       FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0)
       freeze_release "recovery: verification completed by operator"
       journal report "recovered by completing verification" --result COMPLETE
@@ -529,8 +543,14 @@ EOF
   set -e
   log "manifest verification (pre) rc=$MF_RC (plan only; apply refuses on any failure)"
   ct admission --home "$HHOME" || true
-  if [ "$PF_RC" -ne 0 ]; then
-    log "DRY RUN RESULT: NO_GO — the release would refuse in this state (failed gates above)"
+  # EXT-13C: GO requires *both* the operational preflight and the structural manifest verification.
+  # A passing preflight must never launder a failed (rc=2) or unevaluable (rc=3) manifest into GO.
+  if [ "$PF_RC" -eq 3 ] || [ "$MF_RC" -eq 3 ]; then
+    log "DRY RUN RESULT: UNEVALUABLE — a required gate could not be evaluated (preflight rc=$PF_RC, manifest rc=$MF_RC)"
+    exit 3
+  fi
+  if [ "$PF_RC" -ne 0 ] || [ "$MF_RC" -ne 0 ]; then
+    log "DRY RUN RESULT: NO_GO — preflight rc=$PF_RC, manifest rc=$MF_RC (both must pass; nothing was changed)"
     exit 2
   fi
   log "DRY RUN RESULT: GO — every gate passes and no mutation was performed"
@@ -574,7 +594,8 @@ install -m 0644 -o root -g root "$UNIT" "$ARCHIVE/unit/hermes-gateway.service"
 for f in "$DROPIN_DIR"/*.conf; do [ -e "$f" ] && install -m 0644 -o root -g root "$f" "$ARCHIVE/unit/$(basename "$f")"; done
 sha256sum "$UNIT" "$DROPIN_DIR"/*.conf >"$ARCHIVE/unit/SHA256SUMS" 2>/dev/null || true
 git -C "$INSTALL" rev-parse HEAD >"$ARCHIVE/install-before.txt"
-"$PY" "$ENGINE_DIR/restore002_session_inventory.py" --json "$ARCHIVE/sessions-before.json" >/dev/null
+"$PY" "$ENGINE_DIR/restore002_session_inventory.py" --candidate "$CANDIDATE" --source-repo "$SOURCE" \
+  --json "$ARCHIVE/sessions-before.json" >/dev/null
 journal archive "unit, drop-ins, identity and session inventory archived"
 log "archived unit, drop-ins, install identity and session inventory"
 
@@ -728,7 +749,8 @@ log "post-release verification: preflight GO (phase=post, inside the freeze) and
 HOLD_ENV=$(tr '\0' '\n' <"/proc/$NEW_PID/environ" | grep -c '^HERMES_RECOVERY_HOLD=1$' || true)
 [ "$HOLD_ENV" -eq 1 ] || rollback "recovery hold is not set in the new process environment"
 
-"$PY" "$ENGINE_DIR/restore002_session_inventory.py" --json "$ARCHIVE/sessions-after.json" >/dev/null
+"$PY" "$ENGINE_DIR/restore002_session_inventory.py" --candidate "$CANDIDATE" --source-repo "$SOURCE" \
+  --json "$ARCHIVE/sessions-after.json" >/dev/null
 python_compare=$("$PY" - "$ARCHIVE/sessions-before.json" "$ARCHIVE/sessions-after.json" <<'PYEOF'
 import json,sys
 a,b=(json.load(open(p)) for p in sys.argv[1:3])

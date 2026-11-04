@@ -364,6 +364,11 @@ prepare_engine() {
   engine_audit "$ENGINE_DIR" || die "engine inventory audit failed — refusing to plan or apply this candidate"
   log "engine inventory verified (staged == pinned == candidate inventory)"
   export ENGINE_DIR
+  # EXT-13B: the launcher names itself, so the engine's launcher_sha256/launcher_path gates compare
+  # against the file that is actually running rather than a hard-coded $LIB path.
+  export HERMES_RELEASE_LAUNCHER="$SELF"
+  # ...and the manifest the launcher just pinned, so the engine cannot verify a different library.
+  export HERMES_RELEASE_MANIFEST="$MANIFEST"
 }
 
 guard_no_other_release() {
@@ -379,7 +384,8 @@ cmd_plan() {
   prepare_engine
   local rc=0 report
   report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
-  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --source "$REPO" \
+    --engine-dir "$ENGINE_DIR" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" >"$report" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log "manifest verification FAILED — printing gates"
@@ -408,7 +414,8 @@ cmd_verify() {
     exit 2
   fi
   rm -f "$err"
-  ctrl manifest --verify --phase released --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase released --path "$MANIFEST" --repo "$REPO" --source "$REPO" \
+    --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" --expected-post-unit-sha256 "$sha" >/dev/null \
     || { log "manifest verification FAILED"; exit 2; }
   "$ENGINE_DIR/harness/release002_release.sh" --verify-only --candidate "$CANDIDATE"
@@ -419,7 +426,8 @@ cmd_apply() {
   local approval=${HERMES_RELEASE_APPROVAL:-}
   [ "$approval" = "$CANDIDATE" ] || die "set HERMES_RELEASE_APPROVAL=$CANDIDATE to authorise this exact candidate"
   local report; report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
-  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+  ctrl manifest --verify --phase pre --path "$MANIFEST" --repo "$REPO" --source "$REPO" \
+    --engine-dir "$ENGINE_DIR" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" >"$report" \
     || { log "manifest verification FAILED — refusing to stage the supervisor"; cat "$report"; exit 2; }
 
@@ -444,6 +452,7 @@ PYEOF
     --setenv=HERMES_HOME="$HHOME" --setenv=HERMES_RELEASE_APPROVAL="$CANDIDATE"
     --setenv=HERMES_RELEASE_LAUNCH_TOKEN="$token" --setenv=HERMES_RELEASE_TOKEN_EXPECTED="$token"
     --setenv=HERMES_RELEASE_RUN_ID="$run_id" --setenv=HERMES_RELEASE_JOURNAL="$JOURNAL"
+    --setenv=HERMES_RELEASE_INSTALL="$INSTALL" --setenv=HERMES_RELEASE_SOURCE="$REPO"
     /bin/bash "$ENGINE_DIR/harness/release002_release.sh" --apply --candidate "$CANDIDATE" --archive "$archive"
   )
   if [ "$DETACH" -eq 1 ]; then
