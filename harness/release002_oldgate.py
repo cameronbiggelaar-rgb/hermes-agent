@@ -22,6 +22,12 @@ deployed module's own writer and asserts the deployed reader refuses afterwards,
 and asserts it admits again. Marker format drift between the engine and the running code is a
 failure here, not a surprise during the release.
 
+The interpreter that runs the dynamic half is resolved, recorded and pinned by preference:
+``--python`` → ``HERMES_RELEASE_OLDGATE_PYTHON`` → ``<install>/venv/bin/python`` → the probe's own
+interpreter. A pinned path that does not exist is *unevaluable*, never a silent fallback. Whichever
+interpreter answers, a **provenance** gate then asserts that every module exercised resolved inside
+the install tree — coverage is never claimed for code the probe did not run.
+
 Exit codes: 0 covered, 2 uncovered (NO_GO), 3 unevaluable (also NO_GO — never treated as covered),
 64 usage.
 """
@@ -40,6 +46,9 @@ from typing import Any, Optional
 
 SCHEMA = 1
 DEFAULT_INSTALL = "/home/hermes/.hermes/hermes-agent"
+# An explicit pin for the interpreter that runs the dynamic half, so a qualification workspace (or a
+# host whose venv lives elsewhere) can say which interpreter to use without editing the probe.
+INTERPRETER_ENV = "HERMES_RELEASE_OLDGATE_PYTHON"
 
 # producer -> the deployed gate that refuses a *new* admission while the freeze is engaged.
 # ``function`` is where the gate must appear; a symbol found elsewhere in the module does not count.
@@ -297,6 +306,49 @@ print(json.dumps({"state": result.state, "reason": result.reason_code,
 """
 
 
+_PROVENANCE_SCRIPT = """
+import json, sys
+import gateway.drain_control, agent.estop, hermes_cli.gateway_runtime
+print(json.dumps({
+    "version": sys.version.split()[0],
+    "executable": sys.executable,
+    "modules": {m.__name__: getattr(m, "__file__", None)
+                for m in (gateway.drain_control, agent.estop, hermes_cli.gateway_runtime)},
+}))
+"""
+
+
+def _resolved(path: str | Path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:  # pragma: no cover - defensive
+        return Path(path)
+
+
+def _resolve_interpreter(root: Path, py: Optional[str]) -> tuple[Optional[str], str]:
+    """Pick the interpreter for the dynamic half, and say where the choice came from.
+
+    An explicit pin that does not exist is an error the caller must see: falling through to the next
+    candidate would turn an operator typo, or a stale pin, into a green coverage gate.
+    """
+    pins: list[tuple[str, str]] = []
+    if py:
+        pins.append((str(py), "explicit"))
+    env_pin = (os.environ.get(INTERPRETER_ENV) or "").strip()
+    if env_pin:
+        pins.append((env_pin, INTERPRETER_ENV))
+    for candidate, source in pins:
+        if Path(candidate).exists():
+            return candidate, source
+        return None, source
+    venv = root / "venv" / "bin" / "python"
+    if venv.exists():
+        return str(venv), "installed-venv"
+    if sys.executable and Path(sys.executable).exists():
+        return sys.executable, "probe-interpreter"
+    return None, "unresolved"
+
+
 def _run(py: str, install: Path, home: Path, script: str, *args: str) -> dict[str, Any]:
     env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"}}
     env.update(HERMES_HOME=str(home), PYTHONPATH=str(install), PYTHONDONTWRITEBYTECODE="1")
@@ -306,6 +358,12 @@ def _run(py: str, install: Path, home: Path, script: str, *args: str) -> dict[st
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": None, "detail": f"{py}: {exc}"}
     out = proc.stdout.strip().splitlines()
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        # A missing dependency (or any import failure) means the gate was never exercised. Say so:
+        # "uncovered" would claim evidence about admission paths that were never reached.
+        if "ModuleNotFoundError" in err or "ImportError" in err:
+            return {"ok": None, "detail": err[-400:], "rc": proc.returncode}
     return {"ok": proc.returncode == 0, "detail": (out[-1] if out else proc.stderr.strip()[-400:]),
             "rc": proc.returncode}
 
@@ -329,16 +387,43 @@ def oldgate_dynamic(install: str | Path, *, py: Optional[str] = None,
                     home: Optional[str | Path] = None) -> dict[str, Any]:
     """Engage each mechanism through the deployed writer and read it back with the deployed reader."""
     root = Path(install)
-    interpreter = py or str(root / "venv" / "bin" / "python")
+    interpreter, source = _resolve_interpreter(root, py)
     tmp = Path(home) if home else Path(tempfile.mkdtemp(prefix="oldgate-", dir=_scratch()))
     gates: list[dict[str, Any]] = []
+    meta: dict[str, Any] = {"path": interpreter, "source": source, "version": None}
 
     def gate(name: str, ok: Optional[bool], detail: str) -> None:
         gates.append({"gate": name, "ok": ok, "detail": detail})
 
-    if not Path(interpreter).exists():
-        gate("interpreter", None, f"{interpreter} is missing")
-        return {"gates": gates, "ok": False, "evaluable": False, "home": str(tmp)}
+    if interpreter is None or not Path(interpreter).exists():
+        missing = f"{interpreter or 'no interpreter'} is missing"
+        if source in ("explicit", INTERPRETER_ENV):
+            missing += f" (pinned by {source})"
+        gate("interpreter", None, missing)
+        return {"gates": gates, "ok": False, "evaluable": False, "home": str(tmp),
+                "interpreter": meta}
+
+    # Provenance first: if the code the probe would exercise does not come from this tree, none of
+    # the gates below would be evidence about the deployed runtime.
+    provenance = _run(interpreter, root, tmp, _PROVENANCE_SCRIPT)
+    info: dict[str, Any] = {}
+    if provenance["ok"] is True and str(provenance["detail"]).startswith("{"):
+        try:
+            info = json.loads(str(provenance["detail"]))
+        except json.JSONDecodeError:  # pragma: no cover - defensive
+            info = {}
+    meta["version"] = info.get("version")
+    modules = info.get("modules") or {}
+    root_path = _resolved(root)
+    outside = [f"{name}={path or 'not loaded'}" for name, path in modules.items()
+               if not path or not _resolved(path).is_relative_to(root_path)]
+    if provenance["ok"] is not True:
+        gate("interpreter_provenance", provenance["ok"],
+             f"could not import through {interpreter}: {str(provenance['detail'])[-300:]}")
+    elif outside:
+        gate("interpreter_provenance", False, f"outside {root_path}: " + ", ".join(outside)[:300])
+    else:
+        gate("interpreter_provenance", True, f"{len(modules)} module(s) resolve inside {root_path}")
 
     absent = _run(interpreter, root, tmp, _DRAIN_SCRIPT, "absent")
     gate("drain_starts_clear", absent["ok"] is True and absent["detail"] == "absent", str(absent["detail"]))
@@ -373,7 +458,8 @@ def oldgate_dynamic(install: str | Path, *, py: Optional[str] = None,
     if not home:
         shutil.rmtree(tmp, ignore_errors=True)
     return {"gates": gates, "ok": all(g["ok"] is True for g in gates),
-            "evaluable": all(g["ok"] is not None for g in gates), "home": str(tmp)}
+            "evaluable": all(g["ok"] is not None for g in gates), "home": str(tmp),
+            "interpreter": meta}
 
 
 def _scratch() -> str:

@@ -442,8 +442,10 @@ def main() -> int:
         g.add("old_runtime_coverage", None, "--skip-oldgate: coverage not proven (developer dry run)")
     else:
         coverage = oldgate_report(INSTALL)
+        interp = coverage["dynamic"].get("interpreter") or {}
         detail = (f"verdict={coverage['verdict']} producers={len(coverage['producers'])} "
-                  f"uncovered={coverage['uncovered'] or 'none'} unevaluable={coverage['unevaluable'] or 'none'}")
+                  f"uncovered={coverage['uncovered'] or 'none'} unevaluable={coverage['unevaluable'] or 'none'} "
+                  f"interpreter={interp.get('source')}:{interp.get('path')} ({interp.get('version')})")
         g.add("old_runtime_coverage", coverage["ok"], detail)
         g.add("old_runtime_dynamic_gates", coverage["dynamic"].get("ok") is True,
               "; ".join(f"{x['gate']}={'ok' if x['ok'] is True else 'FAIL'}"
