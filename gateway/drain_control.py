@@ -237,3 +237,89 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# --- Cutover admission freeze (release orchestration) -----------------------------
+# A release pauses new work with this same marker: ``drain_requested`` already gates external
+# inbound turns and cron dispatch, publishes ``gateway_state -> "draining"`` (so every client
+# sees the gateway is not accepting work) and keeps the process alive.  What it never covered is
+# admitting a *turn* onto an already-open gateway from a non-messaging producer (API server,
+# A2A, local automation, a worker reservation): those bypass the inbound gate and would start
+# mid-cutover.  :func:`admission_frozen` + the gate in ``session_ingress.execute_admission``
+# close that seam without touching the real shutdown drain, which has its own refusal.
+
+FREEZE_PRINCIPAL_PREFIX = "release-freeze:"
+FREEZE_TURN_TEXT = (
+    "⏸ Not started: a Hermes release is cutting over and new work is paused. "
+    "This request did not run. Send it again once the release reports complete."
+)
+
+
+def freeze_principal(*, home: Optional[Path] = None) -> Optional[str]:
+    """The principal that froze admission, or None when no active freeze marker exists."""
+    body = _active_drain_body(home)
+    if body is None:
+        return None
+    return str(body.get("principal") or "")
+
+
+def freeze_requested(*, home: Optional[Path] = None) -> bool:
+    """True iff an active release-freeze marker is present (a drain marker with a freeze principal)."""
+    principal = freeze_principal(home=home)
+    return bool(principal and principal.startswith(FREEZE_PRINCIPAL_PREFIX))
+
+
+def refresh_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """Keep-alive: re-stamp ``requested_at`` on the current marker, preserving its identity.
+
+    Re-writing a marker whose principal and epoch are unchanged is exactly what
+    :func:`write_drain_request` documents as a refresh; this wrapper keeps the original
+    ``principal``/``suppress_notification`` instead of inventing new ones.
+    """
+    body = read_drain_request(home=home)
+    if body is None:
+        return None
+    body = dict(body)
+    body["requested_at"] = datetime.now(UTC).isoformat()
+    atomic_json_write(drain_request_path(home), body)
+    return body
+
+
+def admission_frozen(runner=None) -> bool:
+    """True while admission must stay closed for a release freeze — not a shutdown.
+
+    Two independent sources, both fail-closed in the "refuse the turn" direction:
+
+    * the in-memory flag the drain watcher maintains (``_external_drain_active``), and
+    * the marker file itself, re-read per admission.
+
+    The flag alone leaves a watcher-interval window in which a request admitted right after the
+    release writes the marker would still start mid-cutover; the file read closes it, because the
+    marker is written before the first mutation and ``read_drain_request`` never raises. Any active
+    external drain (operator or release) refuses new turns. A real shutdown refuses earlier with
+    ``runtime_draining``, so this predicate can never change stop behaviour.
+    """
+    if getattr(runner, "_external_drain_active", False):
+        return True
+    try:
+        # ``drain_requested`` (not a raw read) so the same activeness rule decides here as everywhere
+        # else: the release supervisor refreshes the marker well inside DRAIN_REQUEST_MAX_AGE_SECONDS,
+        # and an orphan left by a dead supervisor expires instead of freezing admission forever.
+        return drain_requested()
+    except Exception:  # pragma: no cover - drain_requested is already total
+        return False
+
+
+def freeze_turn_result() -> dict[str, Any]:
+    """A settled, never-run failed turn for an admission refused by the freeze.
+
+    Shaped like :func:`gateway.session_policy.refused_turn_result`: the caller's input is not
+    silently dropped, it is answered with a failed turn naming the reason, and nothing starts.
+    """
+    from agent.error_surface import build_error_surface_from_result
+    from agent.turn_failure_copy import stamp_failure
+    result = stamp_failure({"final_response": FREEZE_TURN_TEXT, "messages": [], "api_calls": 0,
+                            "tools": [], "failed": True, "completed": False,
+                            "error": FREEZE_TURN_TEXT}, "release_freeze", True)
+    result["error_surface"] = build_error_surface_from_result(result)
+    return result

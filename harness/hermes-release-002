@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# hermes-release-002 — the single authoritative RESTORE-002 release launcher.
+#
+# Installed OUTSIDE the installation it modifies:
+#   /usr/local/lib/hermes-release/hermes-release-002
+#   /usr/local/lib/hermes-release/manifest.json          (pinned identities + checksums)
+#   /usr/local/lib/hermes-release/engine/<candidate>/    (engine + helpers extracted from the candidate)
+#   /var/lib/hermes-release/restore-002/journal.json     (release journal)
+#
+# There is no second documented way to run this release. The engine refuses to mutate unless it is
+# launched by this file (HERMES_RELEASE_LAUNCH_TOKEN), and this file refuses to act unless it still
+# matches the checksum pinned in the manifest, the candidate commit/tree are exactly the pinned
+# ones, the candidate is already available to the installation, the installation is clean and on
+# the expected identity, and no other release supervisor is alive.
+#
+#   hermes-release-002 status            read-only: pins, service, freeze markers, journal
+#   hermes-release-002 stage  --candidate SHA   extract + pin engine, write manifest (root)
+#   hermes-release-002 plan   --candidate SHA   dry run: manifest + preflight, no mutation
+#   hermes-release-002 verify --candidate SHA   post-release verification, no mutation
+#   hermes-release-002 apply  --candidate SHA   one controlled stop/start from a transient unit
+#   hermes-release-002 recover --candidate SHA  deterministic handling of an interrupted supervisor
+#
+# apply/recover/verify need root; plan/status do not. Interrupting `apply` does NOT interrupt the
+# release: the supervisor is a transient systemd unit with RuntimeMaxSec sized from the computed
+# envelope, so it outlives the client. Use `recover` afterwards.
+set -euo pipefail
+
+LIB=${HERMES_RELEASE_LIB:-/usr/local/lib/hermes-release}
+MANIFEST=$LIB/manifest.json
+SELF=$(readlink -f "$0")
+INSTALL=${HERMES_RELEASE_INSTALL:-/home/hermes/.hermes/hermes-agent}
+HHOME=${HERMES_HOME:-/home/hermes/.hermes}
+REPO=${HERMES_RELEASE_REPO:-/home/hermes/work/restore002-fix}
+SERVICE=hermes-gateway.service
+JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
+PY3=/usr/bin/python3.13
+ENGINE_FILES=(harness/release002_release.sh harness/release002_control.py
+              harness/release002_preflight.py harness/restore002_session_inventory.py)
+CMD=""; CANDIDATE=""; DETACH=0
+
+log()  { printf '[hermes-release-002] %s\n' "$*"; }
+die()  { printf '[hermes-release-002] REFUSED: %s\n' "$*" >&2; exit 65; }
+ctrl() {
+  local py=${ENGINE_DIR:-}
+  if [ -z "$py" ]; then
+    local cand; cand=$(manifest_field candidate_commit 2>/dev/null || true)
+    py=$LIB/engine/${cand:0:12}
+  fi
+  env -u PYTHONPATH "$PY3" "$py/harness/release002_control.py" "$@"
+}
+
+usage() { sed -n '2,32p' "$SELF"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    status|stage|plan|verify|apply|recover) CMD=$1; shift ;;
+    --candidate) CANDIDATE=$2; shift 2 ;;
+    --candidate=*) CANDIDATE=${1#*=}; shift ;;
+    --repo) REPO=$2; shift 2 ;;
+    --detach) DETACH=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[ -n "$CMD" ] || { usage; exit 64; }
+
+manifest_field() { # $1=dotted key path
+  [ -f "$MANIFEST" ] || return 1
+  env -u PYTHONPATH "$PY3" - "$MANIFEST" "$1" <<'PYEOF'
+import json, sys
+try:
+    node = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+for part in sys.argv[2].split("."):
+    if isinstance(node, list):
+        node = node[int(part)]
+    else:
+        node = node.get(part) if isinstance(node, dict) else None
+    if node is None:
+        sys.exit(1)
+print(node)
+PYEOF
+}
+
+# ------------------------------------------------------------------ launcher self-integrity
+check_self() {
+  local pinned
+  pinned=$(manifest_field launcher.sha256) || die "no manifest at $MANIFEST — run 'stage' first"
+  local path_pinned; path_pinned=$(manifest_field launcher.path) || die "manifest has no launcher path"
+  [ "$path_pinned" = "$SELF" ] || die "this launcher is $SELF but the manifest pins $path_pinned"
+  [ "$(sha256sum "$SELF" | cut -d' ' -f1)" = "$pinned" ] \
+    || die "launcher checksum does not match the pinned manifest (edited after pinning?)"
+}
+
+# ------------------------------------------------------- launcher must live outside the target
+check_location() {
+  local self_real inst_real
+  self_real=$SELF
+  inst_real=$(readlink -f "$INSTALL")
+  case "$self_real" in
+    "$inst_real"/*) die "launcher is inside the installation being modified ($inst_real)" ;;
+  esac
+  case "$(readlink -f "$(pwd)")" in
+    "$inst_real"/*) die "do not run from inside $inst_real" ;;
+  esac
+  case "$self_real" in
+    /tmp/*|/var/tmp/*|/dev/shm/*) die "launcher must be installed under $LIB, not a temporary path" ;;
+  esac
+  # A worktree of the same repository is just as mutable as the installation it copies.
+  local top; top=$(git -C "$(dirname "$self_real")" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$top" ]; then
+    case "$top" in "$inst_real"|"$inst_real"/*) die "launcher lives in an installation worktree" ;; esac
+    if git -C "$top" remote -v 2>/dev/null | grep -q 'hermes-agent'; then
+      die "launcher is inside a hermes-agent worktree ($top); install it under $LIB"
+    fi
+  fi
+}
+
+require_root() { [ "$(id -u)" -eq 0 ] || die "this command needs root"; }
+
+require_candidate() {
+  [ -n "$CANDIDATE" ] || die "--candidate SHA is required"
+  [ ${#CANDIDATE} -eq 40 ] || die "candidate must be a full 40-character commit SHA"
+}
+
+engine_dir_for() { echo "$LIB/engine/${1:0:12}"; }
+
+# ---------------------------------------------------------------------------- commands
+cmd_status() {
+  log "launcher: $SELF"
+  if [ -f "$MANIFEST" ]; then
+    log "manifest: $MANIFEST"
+    log "  candidate_commit: $(manifest_field candidate_commit || echo '<absent>')"
+    log "  candidate_tree:   $(manifest_field candidate_tree || echo '<absent>')"
+    log "  expected_install: $(manifest_field expected_install_head || echo '<absent>')"
+    log "  launcher_sha256:  $(manifest_field launcher.sha256 || echo '<absent>')"
+    log "  supervisor:       RuntimeMaxSec=$(manifest_field supervisor.runtime_max_sec || echo '?')s (required $(manifest_field supervisor.required_sec || echo '?')s)"
+    if [ "$(manifest_field launcher.sha256 2>/dev/null || true)" = "$(sha256sum "$SELF" | cut -d' ' -f1)" ]; then
+      log "  self-check:       MATCH"
+    else
+      log "  self-check:       DRIFTED — apply/plan/recover will refuse"
+    fi
+  else
+    log "manifest: absent ($MANIFEST) — run 'stage' before any other command"
+  fi
+  log "install: $(git -C "$INSTALL" rev-parse HEAD 2>/dev/null || echo '<unreadable>') tree $(git -C "$INSTALL" rev-parse HEAD^{tree} 2>/dev/null || echo '?') dirty=$(git -C "$INSTALL" status --porcelain 2>/dev/null | wc -l)"
+  log "service: $(systemctl show "$SERVICE" -p ActiveState --value)/$(systemctl show "$SERVICE" -p SubState --value) pid=$(systemctl show "$SERVICE" -p MainPID --value) nrestarts=$(systemctl show "$SERVICE" -p NRestarts --value) timeout_stop=$(systemctl show "$SERVICE" -p TimeoutStopUSec --value)"
+  log "freeze: drain_marker=$([ -e "$HHOME/.drain_request.json" ] && echo present || echo absent) estop=$([ -e "$HHOME/ESTOP" ] && echo present || echo absent)"
+  if [ -f "$JOURNAL" ]; then
+    log "journal: $(env -u PYTHONPATH "$PY3" - "$JOURNAL" <<'PYEOF'
+import json, sys
+j = json.load(open(sys.argv[1]))
+ph = j.get("phases") or []
+last = ph[-1] if ph else {}
+print(f"phase={last.get('phase')} result={j.get('result')} mutated={j.get('mutated')} attempts={j.get('restart_attempts')} updated={j.get('updated_at')}")
+PYEOF
+)"
+  else
+    log "journal: absent ($JOURNAL)"
+  fi
+  log "other supervisors: $(systemctl list-units --all --plain --no-legend 'hermes-release-*' 2>/dev/null | wc -l)"
+}
+
+cmd_stage() {
+  require_root; require_candidate
+  mkdir -p "$LIB" "$(dirname "$JOURNAL")"
+  install -m 0755 "$0" "$LIB/.hermes-release-002.new"
+  [ -x "$LIB/.hermes-release-002.new" ] || die "could not install the launcher"
+  mv -f "$LIB/.hermes-release-002.new" "$LIB/hermes-release-002"
+  SELF=$LIB/hermes-release-002
+  log "launcher installed: $SELF"
+  check_location
+  git -C "$REPO" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null || die "candidate $CANDIDATE absent from $REPO"
+  local tree; tree=$(git -C "$REPO" rev-parse --verify --quiet "$CANDIDATE^{tree}")
+  if ! git -C "$INSTALL" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null; then
+    log "candidate absent from the installation — fetching its objects from $REPO (no refs, no worktree change)"
+    git -C "$INSTALL" fetch --no-tags --quiet "$REPO" "$CANDIDATE" \
+      || die "could not fetch candidate $CANDIDATE into $INSTALL"
+  fi
+  git -C "$INSTALL" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null \
+    || die "candidate $CANDIDATE is still not available to the installation"
+  [ "$(git -C "$INSTALL" rev-parse --verify --quiet "$CANDIDATE^{tree}")" = "$tree" ] \
+    || die "candidate tree in $INSTALL differs from $REPO — refusing to pin"
+  local edir; edir=$(engine_dir_for "$CANDIDATE")
+  rm -rf "$edir"; mkdir -p "$edir/harness"
+  for f in "${ENGINE_FILES[@]}"; do
+    git -C "$REPO" cat-file blob "$CANDIDATE:$f" >"$edir/$f" || die "candidate lacks $f"
+    chmod +x "$edir/$f"
+  done
+  log "engine staged: $edir"
+  MANIFEST=$MANIFEST ENGINE_DIR=$edir env -u PYTHONPATH "$PY3" "$edir/harness/release002_control.py" manifest \
+    --write --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+    --launcher "$SELF" --candidate "$CANDIDATE" \
+    --expected-install-head "$(git -C "$INSTALL" rev-parse HEAD)" \
+    --unit /etc/systemd/system/$SERVICE || die "manifest write failed"
+  log "manifest pinned: $MANIFEST"
+  log "candidate $CANDIDATE tree $tree available to $INSTALL"
+  log "launcher sha256: $(sha256sum "$SELF" | cut -d' ' -f1)"
+  log "next: $(basename "$SELF") plan --candidate $CANDIDATE"
+}
+
+prepare_engine() {
+  require_candidate
+  check_self
+  check_location
+  ENGINE_DIR=$(engine_dir_for "$CANDIDATE")
+  [ -x "$ENGINE_DIR/harness/release002_release.sh" ] || die "engine for $CANDIDATE is not staged (run 'stage')"
+  [ "$(manifest_field candidate_commit)" = "$CANDIDATE" ] || die "manifest pins $(manifest_field candidate_commit), not $CANDIDATE"
+  local pinned_tree; pinned_tree=$(manifest_field candidate_tree)
+  local actual_tree; actual_tree=$(git -C "$INSTALL" rev-parse --verify --quiet "$CANDIDATE^{tree}" 2>/dev/null || true)
+  [ -n "$actual_tree" ] || die "candidate $CANDIDATE is not available to the installation"
+  [ "$actual_tree" = "$pinned_tree" ] || die "candidate tree drifted: pinned $pinned_tree, observed $actual_tree"
+  # Staged engine must equal the candidate blobs, byte for byte.
+  for f in "${ENGINE_FILES[@]}"; do
+    local want got
+    want=$(env -u PYTHONPATH "$PY3" - "$MANIFEST" "$f" <<'PYEOF'
+import json, sys
+print((json.load(open(sys.argv[1])).get("engine", {}).get(sys.argv[2]) or {}).get("blob_sha256") or "")
+PYEOF
+)
+    got=$(sha256sum "$ENGINE_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$want" ] && [ "$want" = "$got" ] || die "staged $f does not match the pinned candidate blob"
+  done
+  export ENGINE_DIR
+}
+
+guard_no_other_release() {
+  local others
+  others=$(pgrep -f 'release002_release\.sh --apply' | grep -v -e "^$$" -e "^$PPID$" || true)
+  [ -z "$others" ] || die "another release engine is running (pids: $others)"
+  if systemctl list-units --all --plain --no-legend 'hermes-release-*' 2>/dev/null | grep -q .; then
+    die "another release supervisor unit exists (hermes-release-*); recover or wait for it"
+  fi
+}
+
+cmd_plan() {
+  prepare_engine
+  local rc=0 report
+  report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
+  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+    --launcher "$SELF" --candidate "$CANDIDATE" >"$report" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "manifest verification FAILED — printing gates"
+    cat "$report"
+    exit 2
+  fi
+  log "manifest verified (launcher, candidate, tree, engine blobs, unit, drop-ins, install identity)"
+  "$ENGINE_DIR/harness/release002_release.sh" --plan --candidate "$CANDIDATE" --archive "${ARCHIVE:-/home/hermes/work/HERMES-RESTORE-002/plan-$(date -u +%Y%m%dT%H%M%SZ)}"
+}
+
+cmd_verify() {
+  require_root; prepare_engine
+  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+    --launcher "$SELF" --candidate "$CANDIDATE" >/dev/null || { log "manifest verification FAILED"; exit 2; }
+  "$ENGINE_DIR/harness/release002_release.sh" --verify-only --candidate "$CANDIDATE"
+}
+
+cmd_apply() {
+  require_root; prepare_engine; guard_no_other_release
+  local approval=${HERMES_RELEASE_APPROVAL:-}
+  [ "$approval" = "$CANDIDATE" ] || die "set HERMES_RELEASE_APPROVAL=$CANDIDATE to authorise this exact candidate"
+  local report; report=$(mktemp "${TMPDIR:-/tmp}/hermes-release-manifest.XXXXXX")
+  ctrl manifest --verify --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+    --launcher "$SELF" --candidate "$CANDIDATE" >"$report" \
+    || { log "manifest verification FAILED — refusing to stage the supervisor"; cat "$report"; exit 2; }
+
+  local runtime_max; runtime_max=$(ctrl envelope | env -u PYTHONPATH "$PY3" -c 'import json,sys;print(json.load(sys.stdin)["runtime_max_sec"])')
+  local run_id; run_id="$(date -u +%Y%m%dT%H%M%SZ)-${CANDIDATE:0:12}"
+  local token; token=$(env -u PYTHONPATH "$PY3" - "$MANIFEST" "$CANDIDATE" "$run_id" <<'PYEOF'
+import hashlib, sys
+print(hashlib.sha256(("".join(open(sys.argv[1]).read().split()) + sys.argv[2] + sys.argv[3]).encode()).hexdigest())
+PYEOF
+)
+  local archive=${ARCHIVE:-/home/hermes/work/HERMES-RESTORE-002/release-$run_id}
+  local logfile=/var/log/hermes-release-002-$run_id.log
+  mkdir -p /var/lib/hermes-release/restore-002 "$(dirname "$archive")"
+  log "candidate $CANDIDATE | supervisor RuntimeMaxSec=${runtime_max}s | run $run_id"
+  systemctl reset-failed "hermes-release-$run_id.service" 2>/dev/null || true
+  local args=(
+    --unit="hermes-release-$run_id" --description="RESTORE-002 release supervisor ($CANDIDATE)"
+    --collect --property=Type=oneshot --property=RuntimeMaxSec="$runtime_max"
+    --property=TimeoutStopSec=420 --property=KillMode=control-group --property=SendSIGKILL=yes
+    --property=WorkingDirectory="$LIB" --property=StandardOutput=append:"$logfile"
+    --property=StandardError=append:"$logfile"
+    --setenv=HERMES_HOME="$HHOME" --setenv=HERMES_RELEASE_APPROVAL="$CANDIDATE"
+    --setenv=HERMES_RELEASE_LAUNCH_TOKEN="$token" --setenv=HERMES_RELEASE_TOKEN_EXPECTED="$token"
+    --setenv=HERMES_RELEASE_RUN_ID="$run_id" --setenv=HERMES_RELEASE_JOURNAL="$JOURNAL"
+    /bin/bash "$ENGINE_DIR/harness/release002_release.sh" --apply --candidate "$CANDIDATE" --archive "$archive"
+  )
+  if [ "$DETACH" -eq 1 ]; then
+    systemd-run "${args[@]}"
+    log "supervisor started detached: hermes-release-$run_id.service (log $logfile)"
+    log "follow with: journalctl -u hermes-release-$run_id -f   then   $(basename "$SELF") verify --candidate $CANDIDATE"
+    return 0
+  fi
+  log "starting supervisor (this blocks; interrupting the client does not stop the release)"
+  set +e
+  systemd-run --wait --pipe "${args[@]}"
+  local rc=$?
+  set -e
+  log "supervisor exited rc=$rc (log $logfile)"
+  if [ "$rc" -eq 0 ]; then
+    log "release verified; admission restored. Run 'verify' for an independent post-check."
+  else
+    log "release did not complete. Run 'recover --candidate $CANDIDATE' to resolve deterministically."
+  fi
+  return "$rc"
+}
+
+cmd_recover() {
+  require_root; prepare_engine
+  log "recovering with journal $JOURNAL"
+  "$ENGINE_DIR/harness/release002_release.sh" --recover --candidate "$CANDIDATE"
+}
+
+case "$CMD" in
+  status)  cmd_status ;;
+  stage)   cmd_stage ;;
+  plan)    cmd_plan ;;
+  verify)  cmd_verify ;;
+  apply)   cmd_apply ;;
+  recover) cmd_recover ;;
+  *) usage; exit 64 ;;
+esac
