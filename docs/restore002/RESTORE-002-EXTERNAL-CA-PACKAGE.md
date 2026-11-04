@@ -1,8 +1,10 @@
-# HERMES-RESTORE-002 — External CA review package (correction 2)
+# HERMES-RESTORE-002 — External CA review package (correction 3)
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
-prerequisites the External CA raised against PR #9, and the single bounded release procedure.
+prerequisites the External CA raised against PR #9 (EXT-01/02), the three release-orchestration
+findings raised against the corrected candidate (EXT-03 launcher integrity, EXT-04 cutover
+admission control, EXT-05 supervisor lifecycle), and the single bounded release procedure.
 
 Nothing in this package has been deployed, merged, restarted or activated. The live service is
 exactly as RESTORE-001 left it.
@@ -12,13 +14,15 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling) | **`e8ed5b9b853aadef7b3830d0194275084b2449e8`**, tree **`913c0edc6d7cb9529259317a44a18fb63c0a2922`** |
+| **release candidate** (code + tests + tooling) | **`1cc36452f47cef911afde6da5139a56e9de2da7e`**, tree **`2ec9f4718f776f28e232b8aeffd5386f803a8258`** |
+| previous candidate (EXT-01/02 only, superseded by EXT-03/04/05) | `e8ed5b9b853aadef7b3830d0194275084b2449e8`, tree `913c0edc6d7cb9529259317a44a18fb63c0a2922` |
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `e8ed5b9b` / `913c0edc` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `1cc36452` / `2ec9f471` |
+| authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
-The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..e8ed5b9b` touches
+The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..1cc36452` touches
 `gateway/restart.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, two test files, four
 harness scripts and one evidence JSON. No file from the reviewed commit was reverted.
 
@@ -221,7 +225,7 @@ write is not evidence that the *intended* change landed somewhere else.
 the module name collided with an existing 27,789-char file that is still byte-identical to both the
 reviewed head and the deployed installation. The intended classifier/planner shipped under a
 distinct name, `gateway/session_resume_plan.py`, with its own tests, and is present in the
-candidate tree (`git cat-file -e e8ed5b9b:gateway/session_resume_plan.py` succeeds).
+candidate tree (`git cat-file -e 1cc36452:gateway/session_resume_plan.py` succeeds).
 
 Two consequences worth stating plainly:
 
@@ -248,7 +252,8 @@ env -u PYTHONPATH TMPDIR=/tmp /usr/bin/python3.13 -m pytest \
 | tree | passed | skipped | failed | errors |
 |---|---|---|---|---|
 | reviewed head `5d02e1da` (7 files, incl. new file absent → 6 files present) | **193** | 4 | **1** | **2** |
-| candidate `e8ed5b9b` | **244** | 4 | **1** | **2** |
+| candidate `e8ed5b9b` (EXT-01/02) | **244** | 4 | **1** | **2** |
+| candidate `1cc36452` (EXT-03/04/05) | **327** | 4 | **1** | **2** |
 
 Delta: **+51 passing**, and the single failure plus two errors are the *same tests with the same
 causes* at both identities (§8). No test was skipped, deleted, xfailed or loosened to reach this
@@ -260,7 +265,9 @@ Collection: `85 tests collected` across the three new/rewritten files
 
 ---
 
-## 5. What changed, precisely (`5d02e1da..e8ed5b9b`)
+## 5. What changed, precisely (`5d02e1da..1cc36452`)
+
+Cumulative, reviewed head to candidate (`19 files changed, 4066 insertions(+), 198 deletions(-)`):
 
 ```
 docs/restore002/session-inventory-20261104.json    | 137 ++++++
@@ -273,8 +280,16 @@ harness/restore002_session_inventory.py             |  92 ++++++
 harness/restore002_tree_audit.py                   | 110 +++++
 tests/gateway/test_stop_budget_adaptation.py       |  12 +-
 tests/gateway/test_stop_budget_probe_failclosed.py | 158 ++++++++++
-10 files changed, 1347 insertions(+), 19 deletions(-)
+gateway/drain_control.py                           |  86 +++++++++
+gateway/session_ingress.py                         |  10 ++
+harness/hermes-release-002                         | 325 ++++++++++++++++++++
+harness/release002_control.py                      | 640 +++++++++++++++++++++++++++
+tests/gateway/test_admission_freeze_gate.py        | 122 ++++++
+tests/harness/__init__.py                          |   0
+tests/harness/test_release002_control.py           | 476 +++++++++++++++++++++
+tests/harness/test_release002_launcher.py          | 306 +++++++++++++++++
 ```
+
 
 No production file, unit, drop-in, hold, session row or receipt was modified. The live install is
 still `e05128fe` / `dc05abd0`, clean.
@@ -283,13 +298,18 @@ still `e05128fe` / `dc05abd0`, clean.
 
 ## 6. The single bounded release procedure
 
-Two artefacts, both in the candidate tree, both read-only until explicitly armed:
+Three artefacts, all in the candidate tree, all read-only until explicitly armed. **There is one
+documented way to run this release** (§11, §15): the launcher installed outside the installation.
+The engine below is an implementation detail that refuses to run itself.
 
+- `harness/hermes-release-002` — 325 lines, the single entry point; `status|stage|plan|apply|
+  verify|recover`; installed to `/usr/local/lib/hermes-release/`; verifies its own checksum manifest
+  before doing anything.
 - `harness/release002_preflight.py` — 380 lines, mutates nothing, exit `0` green / `2` gate failed /
   `3` unevaluable (fail closed, treated as failed).
-- `harness/release002_release.sh` — 312 lines, **dry-run by default**; the mutating path requires
-  `--apply` *and* `HERMES_RELEASE_APPROVAL=<candidate-sha>` matching the checkout, *and* root, and
-  refuses to run inside the gateway's own cgroup.
+- `harness/release002_release.sh` — 620 lines, the bounded engine, **dry-run by default**; refuses
+  `--apply` without `HERMES_RELEASE_LAUNCH_TOKEN`, `HERMES_RELEASE_APPROVAL=<candidate-sha>`, root,
+  and a cgroup outside the gateway's own.
 
 ### 6.1 Preflight — prove nothing will be interrupted (gate `quiet_window`)
 
@@ -475,7 +495,7 @@ in place regardless — that is the owner's decision, not this package's.
 ## 9. Reproduction
 
 ```bash
-cd /home/hermes/work/restore002-fix        # candidate e8ed5b9b / 913c0edc
+cd /home/hermes/work/restore002-fix        # candidate 1cc36452 / 2ec9f471
 
 env -u PYTHONPATH /usr/bin/python3.13 harness/fault_b_repro.py                  # §2.3 table
 env -u PYTHONPATH /usr/bin/python3.13 harness/restore002_tree_audit.py          # §3.2 integrity
@@ -490,7 +510,7 @@ env -u PYTHONPATH /usr/bin/python3.13 -m gateway.session_resume_plan            
 env -u PYTHONPATH /usr/bin/python3.13 -m gateway.session_resume_plan --assume-hold-released
 
 sudo /home/hermes/venv/bin/python /home/hermes/work/restore002-fix/harness/release002_preflight.py
-bash harness/release002_release.sh --candidate e8ed5b9b853aadef7b3830d0194275084b2449e8   # dry run
+/usr/local/lib/hermes-release/hermes-release-002 plan --candidate 1cc36452f47cef911afde6da5139a56e9de2da7e   # dry run
 ```
 
 Base-side comparison worktree: `git worktree add /home/hermes/work/restore002-base 5d02e1da`.
@@ -509,16 +529,328 @@ Session SQL (read-only): `sqlite3 'file:/home/hermes/.hermes/state.db?mode=ro'`.
 - `shellcheck` is not installed on the host; `release002_release.sh` is syntax-checked with `bash -n`
   and exercised dry-run only.
 
-## 11. Release decision requested
+## 11. EXT-RESTORE-002-03 — one authoritative launcher, pinned to verified identities
 
-1. **Approve §6.1–6.4** for one controlled stop/start of `hermes-gateway.service` at candidate
-   `e8ed5b9b853aadef7b3830d0194275084b2449e8` / tree `913c0edc6d7cb9529259317a44a18fb63c0a2922`,
+### 11.1 The finding, and what was wrong before
+
+The corrected candidate shipped `harness/release002_release.sh` inside the tree being modified and
+described it as the thing to run. That is three defects at once: the release entry point is part of
+what the release replaces, its instructions lived in the repository it mutates, and a second
+invocation path (`bash harness/release002_release.sh --apply`) could not be distinguished from the
+sanctioned one. A reviewer could not tell which file was authoritative, and a failed deploy could
+leave no launcher able to roll it back.
+
+### 11.2 The launcher
+
+`harness/hermes-release-002` (325 lines) is installed **outside** the installation:
+
+```
+/usr/local/lib/hermes-release/hermes-release-002
+/usr/local/lib/hermes-release/manifest.json            # pinned identities + checksums
+/usr/local/lib/hermes-release/engine/<candidate>/      # engine + helpers extracted from the candidate
+/var/lib/hermes-release/restore-002/journal.json       # release journal
+/var/log/hermes-release-002-<run-id>.log               # supervisor output
+```
+
+Commands: `status` (read-only), `stage` (extract + pin engine, write manifest; root), `plan` (dry
+run), `apply` (one controlled stop/start from a transient unit; root), `verify` (post-release,
+read-only), `recover` (deterministic handling of an interrupted supervisor; root).
+
+### 11.3 What is pinned, and to what
+
+`manifest.json` records the candidate commit **and** tree, the SHA-256 of the launcher itself, of
+each engine file, of the generated unit and of both drop-ins, the installation identity and the
+release-run id. Every command re-verifies the manifest before it acts, so a launcher that has been
+edited, a partially written `stage`, an engine blob that does not match the pinned candidate, or a
+candidate that no longer resolves to the pinned tree is refused rather than executed.
+
+`stage` is also the step that makes the candidate *available to the installation*: if the object is
+absent it fetches **that one commit** from `$REPO` (`git fetch <repo> <sha>`, no refs, no branch, no
+worktree change) and then refuses to pin unless the tree it just obtained equals the pinned tree.
+
+### 11.4 Refusal matrix (all fail closed, nothing mutated)
+
+| condition | exit | message |
+|---|---|---|
+| launcher is not the copy the manifest pins | 65 | `REFUSED: launcher checksum … does not match the manifest` |
+| manifest missing / unreadable | 65 | `REFUSED: no manifest at …` |
+| candidate is not a full 40-char SHA | 64 | `… is not a full 40-character commit SHA` |
+| candidate absent from the installation, and unfetchable | 65 | `candidate … is not present in <install> (stage it first)` *(see 11.5)* |
+| candidate tree in the installation differs from the repo tree | 65 | `candidate tree in <install> differs from <repo> — refusing to pin` |
+| installation HEAD/tree not as expected, or worktree dirty | 65 | preflight `install_head` / `install_tree` / `install_clean` NO_GO |
+| `apply` without `HERMES_RELEASE_APPROVAL=<candidate>` | 65 | `approval … does not authorise this candidate` |
+| engine invoked directly (no launch token) | 65 | `refusing to run outside the launcher` |
+| `apply` not root | 65 | `needs root` |
+| `apply` from inside the gateway's cgroup | 65 | `refusing to restart the service from inside it` |
+| another release supervisor is alive | 65 | `another release supervisor is running` |
+| interpreter / control library unusable | 65 | `refusing to run: …` (before any phase) |
+
+`plan` and `status` need no privileges and mutate nothing; `apply`, `verify` and `recover` need root.
+
+### 11.5 A defect this finding exposed in the previous candidate
+
+`git rev-parse <absent-sha>^{tree}` **prints its argument back on stdout and exits 0**, so the
+previous gate `CAND_TREE=$(git -C "$INSTALL" rev-parse "$CANDIDATE^{tree}")` reported a candidate as
+"present" when it was not. The candidate-availability gate — the exact thing EXT-03 asks for — was
+vacuous, and the previously reported `CANDIDATE_PRESENT` for the live installation was an artefact
+of it.
+
+Corrected in all three call sites (`release002_release.sh`, `hermes-release-002`,
+`release002_control.py::_git`) by requiring a full 40-character SHA and using
+`rev-parse --verify --quiet`. The honest current state is that **the candidate is not in the live
+installation**, and the engine now says so:
+
+```
+$ bash harness/release002_release.sh --plan --candidate 1cc36452… --archive …
+rc=64
+candidate 1cc36452f47cef911afde6da5139a56e9de2da7e is not present in
+/home/hermes/.hermes/hermes-agent (stage it first: hermes-release-002 stage)
+```
+
+That is the correct, fail-closed answer, and it is why section 15 step 1 is `stage`.
+
+### 11.6 Conflicting instructions removed
+
+Sections 6 and 15 of this package name **only** the launcher path. The engine's own `--apply`
+refuses without `HERMES_RELEASE_LAUNCH_TOKEN`, which only the launcher supplies, so running the
+engine directly is not a second launch path — it is a refusal. Process-boundary tests assert that
+refusal rather than trusting the comment (`tests/harness/test_release002_launcher.py`).
+
+---
+
+## 12. EXT-RESTORE-002-04 — cutover admission control
+
+### 12.1 What was already covered, and the seam that was not
+
+The existing external drain marker already covers messaging ingress and cron ticks: while
+`.drain_request.json` is live, inbound Telegram is refused, cron dispatch is held, and
+`gateway_state` publishes `"draining"`. The uncovered seam was **turn admission from non-messaging
+producers** — the API server, A2A, local automation and worker reservations all reach
+`gateway/session_ingress.py::execute_admission` without touching the messaging gate. A request
+arriving through one of those paths could be admitted after the quiescence samples and before the
+merge.
+
+### 12.2 The freeze
+
+Rather than invent a second pause mechanism, the cutover reuses the drain marker and closes the
+admission seam:
+
+- `gateway/drain_control.py` — `freeze_principal()` / `admission_frozen()` / `freeze_turn_result()`,
+  namespaced `release-freeze:<run-id>`, so a release freeze is distinguishable from an operator
+  drain and can be journalled and recovered deterministically.
+- `admission_frozen()` asks `drain_requested()`, not "does the marker file exist", so the same age
+  rule (`DRAIN_REQUEST_MAX_AGE_SECONDS`) and the same live-machine-epoch test decide everywhere: an
+  orphan marker left by a killed supervisor expires instead of freezing admission forever.
+- `gateway/session_ingress.py` — the freeze check is the **first statement** of
+  `execute_admission`, ahead of `busy_turn_started()` and `note_if_unviewed()`. A refused admission
+  therefore neither registers as active work nor consumes an admission row, and it returns a
+  **settled failed turn** (`freeze_turn_result`) rather than a queue position — no ownerless turn
+  can start after deployment.
+
+### 12.3 Freeze before quiescence, and revalidation before mutation
+
+The engine's order is fixed: `freeze_engage` (12.2, drain marker + ESTOP sentinel, then wait for
+`gateway_state == draining`) → three consecutive quiescence samples 20 s apart of
+`active_agents == 0` **and** live admissions for the current runtime epoch `== 0` → revalidate
+install/candidate/unit/drop-in identities **and** re-assert the freeze and quiescence immediately
+before the first mutation → only then `git merge --ff-only`.
+
+`release002_control.py::admission_report` answers the question the operator must not be able to
+answer optimistically: it splits admissions into **live** and **stale** (a `queued` row abandoned by
+a crash is not live work — `STALE_ADMISSION_HOURS = 6 h`, keyed off the target session's
+`last_activity_at`), reports the freeze state and the ESTOP sentinel, and exposes `evaluable`. The
+CLI exit codes are `0` frozen-and-idle, `2` proven NO_GO, `3` **could not be evaluated** — "probably
+idle" is never a verdict.
+
+### 12.4 Restoring admission
+
+`unfreeze` (success) and every failure path (`rollback`, interrupted supervisor, refused
+configuration) release the freeze through one function: clear the marker only if it is ours, remove
+the ESTOP only if we set it, journal the reason, then confirm `gateway_state` is no longer
+`draining` and the sentinel is gone. `decide_recovery()` does the same from the journal when the
+supervisor died and left the freeze behind.
+
+### 12.5 Evidence that a request cannot race the deployment
+
+- **Live, real gates** — `plan` against a clone of the live installation that does contain the
+  candidate, while Hermes was serving traffic. 22 of 25 gates passed (`install_head`,
+  `install_tree`, `install_clean`, `service_active`, `service_pid`, `no_restart_loop`,
+  `kill_mode_mixed`, `effective_timeout_is_300s`, both drop-ins, `hold_env_active`, runtime state and
+  `code_sha`, `session_inventory`, `no_sigkill_today`, `journal_readable`, memory, disk, DB); the
+  three quiescence gates failed for the right reason — `active_agents=3`, `live_admissions=5`,
+  `freeze_not_engaged`, `estop_not_engaged` — and the engine answered `DRY RUN RESULT: NO_GO`,
+  exit 2, **after** printing the full runbook. Nothing was changed.
+- **Admission report** — the same run printed
+  `{"ok": false, "evaluable": true, "reasons": ["active_agents=3","live_admissions=5",
+  "freeze_not_engaged","estop_not_engaged"]}`: it refuses on live work *and* on the absence of a
+  freeze, rather than accepting quiescence as a property of the moment.
+- **Gate ordering** — `tests/gateway/test_admission_freeze_gate.py` asserts by AST that the freeze
+  check is the first statement of `execute_admission`, so no later refactor can move it behind a
+  side effect without failing the suite.
+- **Behaviour** — a frozen admission returns a settled failed turn and makes **no** session lookup,
+  **no** busy-tag, **no** viewer note and **no** turn; an unfrozen admission still proceeds, so the
+  gate cannot pass vacuously.
+- **Unreadable state** — a marker that exists but cannot be parsed is reported as
+  `present=true, active=false, why="unreadable"`, and an unreadable gateway state forces exit 3.
+  Neither can be read as "no freeze, carry on".
+
+---
+
+## 13. EXT-RESTORE-002-05 — supervisor lifecycle
+
+### 13.1 The supervisor outlives the client
+
+`apply` does not run the engine in the caller's shell. It starts a **transient oneshot systemd
+unit** (`systemd-run --unit=hermes-release-<run-id> --collect`) with:
+
+| property | value | why |
+|---|---|---|
+| `RuntimeMaxSec` | **1500 s** | computed, not guessed (13.2) |
+| `TimeoutStopSec` | 420 s | one restart (300 s) plus settle |
+| `KillMode` | `control-group` | no orphaned children if the unit is stopped |
+| `SendSIGKILL` | `yes` | a stuck supervisor cannot hold the service hostage |
+| `StandardOutput/Error` | `append:/var/log/hermes-release-002-<run-id>.log` | durable, outside the install |
+
+Interrupting the client (`Ctrl-C`, SSH drop, timeout) does **not** stop the release: the unit keeps
+running and `--detach` is available for operators who want the prompt back immediately. A second
+`apply` while a supervisor is alive is refused (`guard_no_other_release`), so no orphan can start a
+competing release.
+
+### 13.2 The envelope is computed from the work it must cover
+
+`release002_control.py::required_envelope_seconds()` sums quiesce + archive + deploy + restart +
+verify + one rollback and adds a safety margin:
+
+```
+$ release002_control.py envelope
+{"cover": ["quiesce","archive","deploy","restart","verify","rollback"],
+ "required_sec": 1290, "safety_sec": 120, "runtime_max_sec": 1500,
+ "start_timeout": 90, "stop_timeout": 300}
+```
+
+1500 s is the shortest limit that still covers a full rollback after a full quiescence wait — a
+limit sized only for the happy path would SIGKILL the supervisor exactly when it is needed most.
+The engine also refuses a `QUIESCE_WAIT` larger than its `MAX_QUIESCE=180 s` share, with
+`freeze_release` and exit 65, so the envelope cannot be overrun by configuration.
+
+### 13.3 Deterministic handling when the supervisor dies
+
+Every phase writes the journal (`/var/lib/hermes-release/restore-002/journal.json`) before and after
+the action it covers. `decide_recovery()` reads the journal and returns exactly one action:
+
+| journal phase | facts | action |
+|---|---|---|
+| before any mutation | any | `unfreeze` (release the freeze, nothing to undo) |
+| `deploy` / `mutated` | install still at the old head | `unfreeze` |
+| `deploy` / `mutated` | install at the candidate, service inactive | `restart_then_verify` |
+| `rollback` / `mutated` | install at the deployed head, service active | `unfreeze` |
+| `rollback` / `mutated` | anything else | `needs_human` — **keep the freeze** |
+| unreadable / unknown phase | any | `needs_human` |
+
+`recover` executes that action; it never retries the release. There is no loop, no backoff, no
+"try again": an interrupted release ends either verified, rolled back, or parked for a human with
+the freeze held. Partial unit configuration is impossible by construction — the unit is regenerated
+in one `gateway install --system` call from the archived copy, and every failure path after the
+first mutation restores the archive and `daemon-reload`s before it restarts.
+
+---
+
+## 14. Test evidence added by this correction
+
+| file | lines | what it proves |
+|---|---|---|
+| `tests/harness/test_release002_control.py` | 476 | decision-level adversarial controls: manifest drift/absence/dirty worktree/wrong commit refuse; freeze engaged + nothing executing passes, unreadable state fails closed; envelope covers quiesce+archive+deploy+restart+verify+one rollback; `decide_recovery` resolves every journal state deterministically |
+| `tests/harness/test_release002_launcher.py` | 306 | process-boundary controls: both scripts parse; every launcher refusal and every engine refusal returns the documented code and message; `plan` with a GO preflight returns 0, prints the runbook and leaves install, worktree, journal, freeze markers and ESTOP untouched; `plan` with a NO_GO preflight returns 2 and still prints the runbook |
+| `tests/gateway/test_admission_freeze_gate.py` | 122 | a frozen admission is answered with a settled failed turn and claims nothing; the gate is the first statement of `execute_admission` (AST); an unfrozen admission still proceeds |
+
+Combined regression (nine suites — stop-budget fail-closed, adaptation, session resume plan, cron
+drain floor, launchd cap, shutdown forensics, gateway service, `tests/harness/`, admission freeze):
+
+```
+1 failed, 327 passed, 4 skipped, 2 errors in 15.65s
+```
+
+The failure and both errors are the same pre-existing ones recorded at `5d02e1da` and at
+`e8ed5b9b` (section 10): a `home_io_guard` `PermissionError` in `test_gateway_service.py`, and two
+`shutdown_forensics` cases blocked by `os.kill(<pid>, 9) — PID is outside the test process subtree`.
+No test that passed at `e8ed5b9b` fails now; 83 tests were added.
+
+---
+
+## 15. The final release command
+
+Exactly one documented path. Nothing below has been run against production; steps 1–3 are the
+owner's authorisation, and step 3 is the only mutating step.
+
+```bash
+SHA=1cc36452f47cef911afde6da5139a56e9de2da7e
+LAUNCH=/usr/local/lib/hermes-release/hermes-release-002
+
+# 0. read-only: what is pinned, what is live, is a freeze still held somewhere?
+$LAUNCH status
+
+# 1. install the launcher outside the installation and pin the engine + candidate (root, no service change)
+sudo $LAUNCH stage --candidate $SHA
+
+# 2. dry run: manifest + full preflight, prints the ordered plan, mutates nothing
+$LAUNCH plan --candidate $SHA          # exit 0 = would proceed, 2 = would refuse, 3 = could not evaluate
+
+# 3. one controlled stop/start under the transient supervisor (root, the only mutating step)
+sudo HERMES_RELEASE_APPROVAL=$SHA $LAUNCH apply --candidate $SHA
+
+# 4. post-release verification: identity, unit, both drop-ins, hold, sessions, no SIGKILL
+$LAUNCH verify --candidate $SHA
+
+# only if the supervisor was interrupted:
+sudo $LAUNCH recover --candidate $SHA
+```
+
+What `apply` does, in order: archive the unit and both drop-ins with a SHA-256 manifest → engage the
+admission freeze (drain marker + ESTOP, wait for `gateway_state == draining`) → quiesce (three
+consecutive 20 s samples of `active_agents == 0` **and** zero live admissions) → revalidate
+identities and re-assert the freeze → `git merge --ff-only <candidate>` → regenerate the unit
+(`TimeoutStopSec=300 s`) → assert the on-disk unit and the effective `systemctl show` value → **one**
+timed `systemctl restart hermes-gateway.service` → scan the journal window for SIGKILL → post-verify → unfreeze → write
+`RECEIPT.md` (`RELEASED_VERIFIED` or `ROLLED_BACK`).
+
+`status`, `plan` and `verify` are non-mutating and safe to run at any time, including while Hermes is
+serving Telegram and cron traffic.
+
+---
+
+## 16. Rollback conditions
+
+Rollback is automatic on any failure after the first mutation, and it is a **single** restart — not a
+retry loop.
+
+| trigger | evidence available | action |
+|---|---|---|
+| `git merge --ff-only` refused | `$ARCHIVE/merge.txt` | restore archive, `daemon-reload`, reset `--hard e05128fe`, one restart, unfreeze, `ROLLED_BACK` |
+| regenerated unit's `TimeoutStopSec` ≠ 300 s, or effective ≠ `5min` | `$ARCHIVE/unit/` + `systemctl show` | same as above — never restart into an unverified envelope |
+| the one timed stop is SIGKILLed | journal `Killed process` / `sigkill=1` | restore + reset + one restart + unfreeze, `ROLLED_BACK`; **the correction is not deployed** |
+| restart does not come back `active` | `systemctl is-active`, `NRestarts` | restore + reset + one restart + unfreeze, `ROLLED_BACK` |
+| post-verify fails (identity, drop-ins, hold, session fingerprint, new SIGKILL) | `$ARCHIVE/post-preflight.json` | restore + reset + one restart + unfreeze, `ROLLED_BACK` |
+| supervisor killed by `RuntimeMaxSec` mid-phase | journal phase | `recover` → `decide_recovery()` (13.3); freeze stays held when the state is ambiguous |
+| any gate unevaluable before the first mutation | preflight report | stop, nothing mutated, exit 3 |
+
+Standing conditions that do **not** change with this release: `90-recovery-hold.conf` and
+`HERMES_RECOVERY_HOLD=1` stay; `95-timeout-stop.conf` stays until 6.6 is separately approved and
+6.2 has produced its timing evidence; the eight empty session rows stay untouched; no hold release
+is requested (it would resume zero sessions); `state.db` is never written by this procedure.
+
+---
+
+## 17. Release decision requested
+
+1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
+   pins the candidate), `plan` (dry run), then one `apply` for candidate
+   `1cc36452f47cef911afde6da5139a56e9de2da7e` / tree `2ec9f4718f776f28e232b8aeffd5386f803a8258`,
    retaining both drop-ins and the recovery hold.
-2. **Defer §6.6** (retirement of `95-timeout-stop.conf`) until §6.2 has passed and its timing +
+2. **Defer 6.6** (retirement of `95-timeout-stop.conf`) until 6.2 has passed and its timing +
    SIGKILL evidence is published.
-3. **No hold release** is requested. §7 shows it would resume zero sessions today; the eight empty
-   rows stay untouched.
+3. **No hold release** is requested. Section 7 shows it would resume zero sessions today; the eight
+   empty rows stay untouched.
 4. **No merge** is requested. PR #9 stays draft until the owner accepts the release evidence.
 
-Any gate that cannot be evaluated stops the procedure before mutation. There is no automatic
-retry, and no unrelated cleanup or updater work is part of this package.
+Any gate that cannot be evaluated stops the procedure before mutation. There is no automatic retry,
+no orphaned supervisor, and no unrelated cleanup or updater work in this package.
