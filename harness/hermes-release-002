@@ -38,9 +38,9 @@ REPO=${HERMES_RELEASE_REPO:-/home/hermes/work/restore002-fix}
 SERVICE=hermes-gateway.service
 JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
 PY3=/usr/bin/python3.13
-ENGINE_FILES=(harness/release002_release.sh harness/release002_control.py
-              harness/release002_preflight.py harness/release002_oldgate.py
-              harness/restore002_session_inventory.py)
+# EXT-RESTORE-002-12: the engine inventory lives in release002_control.py (ENGINE_FILES /
+# PINNED_ENGINE_FILES). This launcher deliberately holds no copy of it: `stage` stages exactly what
+# the candidate's own control declares, and `prepare_engine` audits staged == pinned == inventory.
 CMD=""; CANDIDATE=""; DETACH=0; DRY_RUN=0; FORCE=0; SOURCE_COMMIT=""
 
 log()  { printf '[hermes-release-002] %s\n' "$*"; }
@@ -52,6 +52,31 @@ ctrl() {
     py=$LIB/engine/${cand:0:12}
   fi
   env -u PYTHONPATH "$PY3" "$py/harness/release002_control.py" "$@"
+}
+pinned_blob() { # $1 = manifest, $2 = repo-relative path -> pinned blob_sha256 ("" when unpinned)
+  env -u PYTHONPATH "$PY3" - "$1" "$2" <<'PYEOF'
+import json, sys
+print((json.load(open(sys.argv[1])).get("engine", {}).get(sys.argv[2]) or {}).get("blob_sha256") or "")
+PYEOF
+}
+engine_inventory() { # $1 = control file, $2 = staged|pinned
+  env -u PYTHONPATH "$PY3" "$1" engine-files --set "${2:-staged}"
+}
+engine_audit() { # $1 = engine dir, $2 = manifest (default $MANIFEST). rc != 0 means refuse.
+  # The staged control is checked against its own pin before it is believed: a control whose bytes
+  # drifted could otherwise declare an inventory that legitimises exactly the drift we are closing.
+  local dir=$1 man=${2:-$MANIFEST} ctl want got out rc=0
+  ctl=$dir/harness/release002_control.py
+  want=$(pinned_blob "$man" harness/release002_control.py || true)
+  got=$(sha256sum "$ctl" 2>/dev/null | cut -d' ' -f1 || true)
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    log "REFUSED: staged harness/release002_control.py does not match its pinned blob — refusing to trust its inventory"
+    return 2
+  fi
+  out=$(env -u PYTHONPATH "$PY3" "$ctl" engine-audit --manifest "$man" --engine-dir "$dir" 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] || log "REFUSED: staged engine inventory does not match the pinned manifest (rc=$rc)"
+  return "$rc"
 }
 
 usage() { sed -n '2,36p' "$SELF"; }
@@ -128,6 +153,16 @@ check_location() {
 }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "this command needs root"; }
+require_stage_root() { # EXT-12: staging into a throwaway library is a test fixture, never the live one
+  [ "$(id -u)" -eq 0 ] && return 0
+  if [ "${HERMES_RELEASE_STAGE_UNPRIVILEGED:-0}" = "1" ] \
+     && [ "${LIB}" != "/usr/local/lib/hermes-release" ] \
+     && [ "${JOURNAL}" != "/var/lib/hermes-release/restore-002/journal.json" ]; then
+    log "unprivileged staging into $LIB (test fixture only)"
+    return 0
+  fi
+  die "stage needs root (or HERMES_RELEASE_STAGE_UNPRIVILEGED=1 with a non-default \$HERMES_RELEASE_LIB and \$HERMES_RELEASE_JOURNAL)"
+}
 
 require_candidate() {
   [ -n "$CANDIDATE" ] || die "--candidate SHA is required"
@@ -252,7 +287,7 @@ PYEOF
 }
 
 cmd_stage() {
-  require_root; require_candidate
+  require_stage_root; require_candidate
   mkdir -p "$LIB" "$(dirname "$JOURNAL")"
   install -m 0755 "$0" "$LIB/.hermes-release-002.new"
   [ -x "$LIB/.hermes-release-002.new" ] || die "could not install the launcher"
@@ -273,17 +308,39 @@ cmd_stage() {
     || die "candidate tree in $INSTALL differs from $REPO — refusing to pin"
   local edir; edir=$(engine_dir_for "$CANDIDATE")
   rm -rf "$edir"; mkdir -p "$edir/harness"
-  for f in "${ENGINE_FILES[@]}"; do
+  # EXT-12: stage exactly what the candidate's own control declares — this launcher holds no list.
+  local ctl_dir; ctl_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermes-engine-inventory.XXXXXX")
+  git -C "$REPO" cat-file blob "$CANDIDATE:harness/release002_control.py" >"$ctl_dir/release002_control.py" \
+    || { rm -rf "$ctl_dir"; die "candidate $CANDIDATE lacks harness/release002_control.py"; }
+  local -a staged_files=()
+  mapfile -t staged_files < <(engine_inventory "$ctl_dir/release002_control.py" staged) || true
+  rm -rf "$ctl_dir"
+  [ "${#staged_files[@]}" -ge 5 ] \
+    || die "candidate $CANDIDATE declares an implausible engine inventory (${#staged_files[@]} file(s))"
+  for f in "${staged_files[@]}"; do
+    case "$f" in
+      harness/*) ;;
+      *) die "candidate $CANDIDATE declares an engine file outside harness/: $f" ;;
+    esac
+    case "$f" in
+      *..*|/*) die "candidate $CANDIDATE declares an unsafe engine path: $f" ;;
+    esac
     git -C "$REPO" cat-file blob "$CANDIDATE:$f" >"$edir/$f" || die "candidate lacks $f"
     chmod +x "$edir/$f"
   done
-  log "engine staged: $edir"
+  log "engine staged: $edir (${#staged_files[@]} files, inventory from the candidate)"
+  # Written beside the real manifest and published only after the audit: a manifest describing an
+  # engine directory that failed verification must never become the staged manifest.
+  local mnew="${MANIFEST}.new.$$"
   MANIFEST=$MANIFEST ENGINE_DIR=$edir env -u PYTHONPATH "$PY3" "$edir/harness/release002_control.py" manifest \
-    --write --path "$MANIFEST" --repo "$REPO" --install "$INSTALL" \
+    --write --path "$mnew" --repo "$REPO" --install "$INSTALL" \
     --launcher "$SELF" --candidate "$CANDIDATE" \
     --expected-install-head "$(git -C "$INSTALL" rev-parse HEAD)" \
-    --unit /etc/systemd/system/$SERVICE || die "manifest write failed"
+    --unit /etc/systemd/system/$SERVICE || { rm -f "$mnew"; die "manifest write failed"; }
+  engine_audit "$edir" "$mnew" || { rm -f "$mnew"; die "engine inventory audit failed — manifest not published"; }
+  mv -f "$mnew" "$MANIFEST"
   log "manifest pinned: $MANIFEST"
+  log "engine inventory verified: staged == pinned == candidate inventory, byte-exact"
   log "candidate $CANDIDATE tree $tree available to $INSTALL"
   log "launcher sha256: $(sha256sum "$SELF" | cut -d' ' -f1)"
   log "next: $(basename "$SELF") plan --candidate $CANDIDATE"
@@ -300,17 +357,12 @@ prepare_engine() {
   local actual_tree; actual_tree=$(git -C "$INSTALL" rev-parse --verify --quiet "$CANDIDATE^{tree}" 2>/dev/null || true)
   [ -n "$actual_tree" ] || die "candidate $CANDIDATE is not available to the installation"
   [ "$actual_tree" = "$pinned_tree" ] || die "candidate tree drifted: pinned $pinned_tree, observed $actual_tree"
-  # Staged engine must equal the candidate blobs, byte for byte.
-  for f in "${ENGINE_FILES[@]}"; do
-    local want got
-    want=$(env -u PYTHONPATH "$PY3" - "$MANIFEST" "$f" <<'PYEOF'
-import json, sys
-print((json.load(open(sys.argv[1])).get("engine", {}).get(sys.argv[2]) or {}).get("blob_sha256") or "")
-PYEOF
-)
-    got=$(sha256sum "$ENGINE_DIR/$f" 2>/dev/null | cut -d' ' -f1)
-    [ -n "$want" ] && [ "$want" = "$got" ] || die "staged $f does not match the pinned candidate blob"
-  done
+  # EXT-12: staged engine == pinned engine map == the candidate's inventory, byte for byte. The old
+  # per-file loop could only look up the files this launcher already listed, so it could not tell
+  # that the launcher's list and the manifest's list had diverged — which is exactly how the
+  # missing inventory pin survived until the first real PLAN.
+  engine_audit "$ENGINE_DIR" || die "engine inventory audit failed — refusing to plan or apply this candidate"
+  log "engine inventory verified (staged == pinned == candidate inventory)"
   export ENGINE_DIR
 }
 

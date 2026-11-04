@@ -46,6 +46,29 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 #   ESTOP sentinel -> internal/self-injected turns, kanban watchers, goals loop and heartbeat ticks
 FREEZE_MECHANISMS = ("drain_marker", "estop_sentinel")
 
+# EXT-RESTORE-002-12 — one authoritative engine inventory.
+#
+# Before this constant existed the set of engine files lived in two places: the launcher's
+# ``ENGINE_FILES`` array (what it staged and ran) and a literal list inside ``manifest --write``
+# (what it pinned). The two drifted, the launcher required a pin the manifest never wrote, and the
+# release refused at PLAN. Staging and pinning now both read these tuples; nothing else may carry a
+# copy of the list.
+#
+# ``ENGINE_FILES``  — every file copied into the engine directory and executed from there.
+# ``LAUNCHER_REL``  — the candidate's launcher blob. It is *not* staged (the installed launcher runs
+#                     from the library root), but it is pinned so the manifest records which
+#                     candidate launcher this release corresponds to, separately from
+#                     ``manifest["launcher"]["sha256"]`` which describes the file actually installed.
+ENGINE_FILES: tuple[str, ...] = (
+    "harness/release002_release.sh",
+    "harness/release002_control.py",
+    "harness/release002_preflight.py",
+    "harness/release002_oldgate.py",
+    "harness/restore002_session_inventory.py",
+)
+LAUNCHER_REL = "harness/hermes-release-002"
+PINNED_ENGINE_FILES: tuple[str, ...] = ENGINE_FILES + (LAUNCHER_REL,)
+
 # Supervisor envelope: every stage the supervisor may have to run, upper-bounded.
 QUIESCE_MAX_SECONDS = 180          # freeze -> three consecutive zero samples, 60 s apart
 DEPLOY_MAX_SECONDS = 60            # ff-only checkout + unit regeneration
@@ -188,8 +211,8 @@ def unit_timeout_stop_seconds(unit_path: "str | Path") -> Optional[float]:
 # ------------------------------------------------------------------- manifest (EXT-07)
 def build_manifest(*, repo: str | Path, candidate: str, install: str | Path, launcher: str | Path,
                    unit: str | Path, dropins: "list[str | Path] | dict[str, str | Path]",
-                   engine_paths: list[str],
-                   expected_install_head: str) -> dict[str, Any]:
+                   expected_install_head: str,
+                   engine_paths: Optional[list[str]] = None) -> dict[str, Any]:
     """Describe every identity the release depends on, pinned by checksum.
 
     Two identity sets, because the release *changes* the identity it was staged against (EXT-07):
@@ -199,10 +222,15 @@ def build_manifest(*, repo: str | Path, candidate: str, install: str | Path, lau
     * ``post_release`` — what must be true afterwards: the candidate HEAD/tree, the regenerated
       unit's effective ``TimeoutStopSec`` and the same drop-in bytes (a release may not quietly
       retire the recovery hold or the timeout override).
+
+    ``engine_paths`` exists only so fixtures can build synthetic manifests; every production caller
+    must omit it and take ``PINNED_ENGINE_FILES``, so staging and pinning cannot drift apart again
+    (EXT-12).
     """
     tree = object_tree(repo, candidate)
     install_ident = git_identity(install)
     dropin_map = {Path(p).name: sha256_file(p) for p in dropins}
+    engine_list = list(PINNED_ENGINE_FILES) if engine_paths is None else list(engine_paths)
     return {
         "schema": MANIFEST_SCHEMA, "release": RELEASE,
         "candidate_commit": candidate, "candidate_tree": tree,
@@ -220,11 +248,87 @@ def build_manifest(*, repo: str | Path, candidate: str, install: str | Path, lau
             "dropins": dict(dropin_map),
         },
         "observed_install_at_capture": {"head": install_ident.get("head"), "tree": install_ident.get("tree")},
-        "engine": {p: {"blob_sha256": blob_sha256(repo, candidate, p)} for p in engine_paths},
+        "engine": {p: {"blob_sha256": blob_sha256(repo, candidate, p)} for p in engine_list},
         "launcher": {"path": str(launcher), "sha256": sha256_file(launcher)},
         "supervisor": {"runtime_max_sec": envelope_plan()["runtime_max_sec"],
                        "required_sec": envelope_plan()["required_sec"]},
         "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def engine_inventory(*, pinned: bool = False) -> list[str]:
+    """The one authoritative engine-file inventory (EXT-12).
+
+    ``pinned=False`` returns the files the launcher stages and runs; ``pinned=True`` adds the
+    candidate launcher blob, which the manifest pins alongside them.
+    """
+    return list(PINNED_ENGINE_FILES if pinned else ENGINE_FILES)
+
+
+def audit_engine(manifest: dict[str, Any], *, engine_dir: str | Path) -> dict[str, Any]:
+    """EXT-12: the staged engine, the pinned engine map and the inventory must be one set.
+
+    Three independent sets can drift apart and each failure mode is named separately:
+
+    * a staged file the manifest never pinned — the EXT-12 defect itself, silent before this audit
+      because the manifest simply had no entry for it and nothing compared the sets;
+    * a manifest entry outside the inventory — a pin nothing stages and nothing verifies, which
+      makes the manifest look stricter than the release actually is;
+    * a staged file whose bytes are not the pinned bytes.
+
+    ``__pycache__`` and ``*.pyc`` are ignored: importing a sibling module is not a release file.
+    Nothing is written and no service is touched, so this runs in PLAN as well as APPLY.
+    """
+    engine_dir = Path(engine_dir)
+    raw = manifest.get("engine")
+    pinned_map = raw if isinstance(raw, dict) else {}
+    pinned = {str(k) for k in pinned_map}
+    inventory = set(ENGINE_FILES)
+    on_disk = {
+        str(p.relative_to(engine_dir)).replace(os.sep, "/")
+        for p in engine_dir.rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
+    } if engine_dir.is_dir() else set()
+
+    gates: list[dict[str, Any]] = []
+
+    def gate(name: str, ok: bool, detail: str = "") -> bool:
+        gates.append({"gate": name, "ok": bool(ok), "detail": detail})
+        return bool(ok)
+
+    missing_pin = sorted(inventory - pinned)
+    unexpected_pin = sorted(pinned - set(PINNED_ENGINE_FILES))
+    missing_staged = sorted(inventory - on_disk)
+    unexpected_staged = sorted(on_disk - inventory)
+
+    gate("engine_dir_present", engine_dir.is_dir(), str(engine_dir))
+    gate("inventory_plausible", len(ENGINE_FILES) >= 5, f"{len(ENGINE_FILES)} staged file(s)")
+    gate("manifest_engine_set_is_the_inventory", pinned == set(PINNED_ENGINE_FILES),
+         f"pinned={len(pinned)} inventory={len(PINNED_ENGINE_FILES)}")
+    gate("no_staged_file_missing_from_manifest", not missing_pin, ",".join(missing_pin))
+    gate("no_unexpected_manifest_engine_entry", not unexpected_pin, ",".join(unexpected_pin))
+    gate("launcher_blob_pinned", LAUNCHER_REL in pinned, LAUNCHER_REL)
+    gate("every_inventory_file_staged", not missing_staged, ",".join(missing_staged))
+    gate("no_unexpected_staged_file", not unexpected_staged, ",".join(unexpected_staged))
+
+    mismatched: list[str] = []
+    for rel in sorted(inventory & on_disk):
+        entry = pinned_map.get(rel)
+        want = entry.get("blob_sha256") if isinstance(entry, dict) else None
+        got = sha256_file(engine_dir / rel)
+        if not (isinstance(want, str) and SHA256_RE.match(want) and got == want):
+            mismatched.append(rel)
+    gate("staged_bytes_match_pins", not mismatched, ",".join(mismatched))
+
+    failed = [g["gate"] for g in gates if not g["ok"]]
+    return {
+        "ok": not failed,
+        "failed": failed,
+        "gates": gates,
+        "inventory": sorted(inventory),
+        "pinned": sorted(pinned),
+        "on_disk": sorted(on_disk),
+        "engine_dir": str(engine_dir),
     }
 
 
@@ -817,6 +921,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     m.add_argument("--expected-post-unit-sha256", dest="expected_post_unit_sha256", default=None,
                    help="journaled checksum of the regenerated unit, when the caller has it")
 
+    ef = sub.add_parser("engine-files", help="the authoritative engine inventory (EXT-12)")
+    ef.add_argument("--set", dest="which", default="staged", choices=["staged", "pinned"])
+
+    au = sub.add_parser("engine-audit", help="staged vs pinned engine inventory audit (EXT-12)")
+    au.add_argument("--manifest", default=MANIFEST_DEFAULT)
+    au.add_argument("--engine-dir", dest="engine_dir", required=True)
+
     a = sub.add_parser("admission", help="freeze/quiescence facts (read-only)")
     a.add_argument("--home", default="")
 
@@ -942,14 +1053,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return _emit({"ok": False, "failed": ["manifest_readback_mismatch"], "path": str(target)}, 65)
             return _emit({"ok": True, "state": "bootstrapped", "path": str(target), "manifest": payload}, 0)
         if args.write:
-            engine_paths = ["harness/release002_release.sh", "harness/release002_control.py",
-                            "harness/release002_preflight.py", "harness/release002_oldgate.py",
-                            "harness/hermes-release-002"]
+            # EXT-12: the pinned set is the shared inventory, never a second literal list.
             manifest = build_manifest(
                 repo=args.repo, candidate=args.candidate, install=args.install, launcher=args.launcher,
                 unit=args.unit, dropins=[f"{args.unit}.d/90-recovery-hold.conf",
                                          f"{args.unit}.d/95-timeout-stop.conf"],
-                engine_paths=engine_paths, expected_install_head=args.expected_install_head)
+                expected_install_head=args.expected_install_head)
             Path(args.path).parent.mkdir(parents=True, exist_ok=True)
             Path(args.path).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
             return _emit({"manifest": manifest}, 0)
@@ -959,6 +1068,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         report = verify_manifest(manifest, repo=args.repo, install=args.install, launcher=args.launcher,
                                  phase=args.phase,
                                  expected_post_unit_sha256=args.expected_post_unit_sha256)
+        return _emit(report, 0 if report["ok"] else 2)
+
+    if args.cmd == "engine-files":
+        for rel in engine_inventory(pinned=args.which == "pinned"):
+            print(rel)
+        return 0
+
+    if args.cmd == "engine-audit":
+        manifest = _read_json(Path(args.manifest))
+        if not isinstance(manifest, dict):
+            return _emit({"ok": False, "failed": ["manifest_unreadable"], "path": args.manifest}, 3)
+        report = audit_engine(manifest, engine_dir=args.engine_dir)
         return _emit(report, 0 if report["ok"] else 2)
 
     return 64

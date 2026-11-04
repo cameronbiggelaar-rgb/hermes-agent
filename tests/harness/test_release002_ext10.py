@@ -63,7 +63,8 @@ def make_repo(tmp_path: Path) -> Path:
     git(repo, "config", "user.name", "t")
     (repo / "harness").mkdir()
     for name in ("hermes-release-002", "release002_control.py", "release002_preflight.py",
-                 "release002_oldgate.py", "release002_release.sh"):
+                 "release002_oldgate.py", "release002_release.sh",
+                 "restore002_session_inventory.py"):
         shutil.copy2(HARNESS / name, repo / "harness" / name)
     (repo / "gateway").mkdir()
     (repo / "gateway" / "seed.py").write_text("VALUE = 1\n", encoding="utf-8")
