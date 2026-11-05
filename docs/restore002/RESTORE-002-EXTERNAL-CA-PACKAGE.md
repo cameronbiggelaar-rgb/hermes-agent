@@ -1713,6 +1713,65 @@ tests/harness/test_release002_ext14.py                           →   11 passed
 
 ---
 
+## 24. EXT-RESTORE-002-15 — quiescence, attributed; the driver's receipt, made unconditional
+
+Full analysis: [`EXT15-QUIESCENCE-ATTRIBUTION.md`](EXT15-QUIESCENCE-ATTRIBUTION.md).
+
+**Correction 10.** RESTORE-002's `STOPPED_SAFE` is explained, and it was not a busy host.
+
+1. **Root cause — the sequence gates itself.** Apply mode runs the operational preflight, whose
+   critical gate `no_active_turns` requires `gateway_state.active_agents == 0`, and exits `2` on
+   NO_GO *before* `freeze_engage`. The freeze — the only mechanism that empties the gateway — is
+   engaged afterwards, at which point the engine runs its real quiescence probe
+   (`ct admission`, 3 × 20 s). The engine's own dry-run text states the intent
+   ("*they are re-evaluated after the freeze*"); apply mode treats the same verdict as terminal.
+   Independently, `admission_report()` appends `freeze_not_engaged` whenever no drain marker is
+   present, so a *pre-freeze* quiescence probe cannot succeed at all — 0 agents, 0 admissions, no
+   freeze still reads "not quiet" (all 129 EXT-14 samples carried `"drain_marker_active": false`).
+   **§23's two failing gates are therefore unsatisfiable in the position the sequence evaluates
+   them, not merely a consequence of ordinary load.**
+
+2. **Attribution (Phase 1).** The final admission 12:34–12:55 local on 5 November was held by
+   **`20261101_113736_7565f3f9`** — present in 21/21 minutes, one turn, API calls `#251` → `#364`.
+   `20261105_083311_65e056f7` ran until a 300 s compression stall and ended
+   `Turn ended: reason=text_response` at 12:40:05; `20261103_111647_bd71d22f` was idle. The owning
+   *admission sequence number* at 12:54:59 is **UNKNOWN** (no timestamps in `session_admissions`;
+   the engine's own `live_admissions` classifies by `last_activity_at`). 107 of the 114 epoch-23
+   rows across the three sessions are terminal, including 29 `cancelled` — the admissions were live
+   work, not leaked rows.
+
+3. **Gate verdict (Phase 2).** A genuine long-running execution: **yes**. B overlapping background
+   activity: **yes**. C non-terminal after execution ends: **not evidenced**. D accounting defect:
+   **yes, one direction only** — `active_agents` is published *at every turn boundary*
+   (`agent_cache._persist_active_agents`), so it lags a turn that starts afterwards (12:34:25 read
+   `1` while two sessions executed) and inherits cron pulses; it never under-reported work in the
+   EXT-14 window. E: not needed.
+
+4. **Maintenance window (Phase 3).** Over 1097 minutes: 34 % busy, 66 % idle, 47 idle runs,
+   31 ≥ 120 s, 21 ≥ 180 s, 8 ≥ 5 min, longest 411 min (00:39 → 07:30) and 110 min (09:43). The
+   130 s settle is not the limiter. Log silence is not absence of an active turn — the two apparent
+   gaps inside the driver window were a long tool call and a compression stall. The safe sequence is
+   the engine's own steps 1–5: archive → **freeze** → quiesce inside the freeze → revalidate →
+   one merge/restart. The single change required is that a pre-flight whose **only** failures are
+   the quiescence pair must defer to the in-freeze probe instead of aborting. It removes a TOCTOU
+   window (quiescence is checked *before* new work is refused today), kills nothing, writes no
+   session record, and keeps drain/ESTOP exactly as reviewed. **It is a release-sequence change: a
+   separate candidate, External CA review and new owner authority. Not implemented on any default
+   path here.**
+
+5. **Driver (Phase 4).** `harness/release002_driver.sh` writes `summary.json` + `RECEIPT.md` for
+   every terminal result exactly once (deadline, UNEVALUABLE, guard failure, SIGTERM, apply
+   failure, success), publishes at most once, records the runtime snapshot beside every PLAN verdict
+   and classifies each blocker as `quiescence` or a named `other` gate — evidence only, never a
+   NO_GO → GO conversion.
+
+```
+tests/harness/test_release002_ext15.py   18 passed
+tests/harness (full)                    247 passed in 73.20s
+```
+
+---
+
 ## 17. Release decision requested
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
