@@ -85,3 +85,25 @@ def test_effective_timeout_honours_the_operator_dropin(tmp_path) -> None:
     # A drop-in that lowers it also wins, exactly as systemd's last-assignment rule.
     (dropins / "99-lower.conf").write_text("[Service]\nTimeoutStopUSec=5min\n")
     assert ctrl.unit_timeout_stop_seconds(unit) == 300.0
+
+
+def test_session_inventory_defaults_follow_the_release_home(tmp_path) -> None:
+    """D-9: the inventory's default DB was the literal operator path, not the engine's home."""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+
+    root = tmp_path / "home"
+    (root / "sessions").mkdir(parents=True)
+    (root / "state.db").write_bytes(b"")
+    env = {k: v for k, v in _os.environ.items() if k != "PYTHONPATH"}
+    env["HERMES_HOME"] = str(root)
+    env.pop("HERMES_RELEASE_HOME", None)
+    out = _sp.run(
+        ["/usr/bin/python3", "-c",
+         "import restore002_session_inventory as m, json; print(json.dumps([m.DB, m.INDEX]))"],
+        cwd=str(Path(__file__).resolve().parents[2] / "harness"), env=env,
+        capture_output=True, text=True, check=True).stdout
+    db, index = _json.loads(out)
+    assert db == str(root / "state.db")
+    assert index == str(root / "sessions" / "sessions.json")

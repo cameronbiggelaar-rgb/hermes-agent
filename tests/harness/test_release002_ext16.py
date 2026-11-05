@@ -312,7 +312,8 @@ def test_quiescence_gates_are_pending_before_the_freeze():
     source = (HARNESS / "release002_preflight.py").read_text()
     assert "QUIESCENCE_GATES" in source
     block = source[source.index("QUIESCENCE_GATES"):]
-    assert "deferred=True" in block[:4000]
+    # Not a fixed-width window: unrelated edits above the deferral loop must not make this fail.
+    assert "deferred=True" in block
     assert "pending_gates" in source
 
 

@@ -164,7 +164,14 @@ class TestReleasedManifestVerification:
         repo, base, cand, inst, launcher, unit, mpath = _fixture(tmp_path)
         _deploy(inst, unit, cand)
         unit.write_text("[Service]\nTimeoutStopSec=60\nRestart=always\n", encoding="utf-8")
+        # The unit's own assignment is not the value systemd enforces: the operator drop-in
+        # ``95-timeout-stop.conf`` overrides it, so lowering the unit alone leaves the effective
+        # timeout at 300 s and must NOT refuse. Lowering the drop-in as well must refuse.
         sha = ctl.sha256_file(unit)
+        rel = _verify(mpath, repo, inst, launcher, cand, "released", expected_sha=sha)
+        assert rel.returncode == 0, json.loads(rel.stdout)["failed"]
+        (unit.parent / f"{unit.name}.d" / "95-timeout-stop.conf").write_text(
+            "[Service]\nTimeoutStopSec=60\n", encoding="utf-8")
         rel = _verify(mpath, repo, inst, launcher, cand, "released", expected_sha=sha)
         assert rel.returncode == 2
         assert "unit_timeout_released" in json.loads(rel.stdout)["failed"]

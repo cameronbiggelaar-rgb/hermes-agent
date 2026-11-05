@@ -457,10 +457,13 @@ class TestManifestIdentities:
                                      source=str(fx["repo"]), engine_dir=str(fx["engine_dir"]))
         assert result["ok"] is True, result["failed"]
         assert [g["gate"] for g in result["gates"] if g["gate"].startswith("worktree_matches")]
-        # ... and the same unit copy with the old 210s still in it is refused, so the gate is live.
-        unit.write_text(unit.read_text(encoding="utf-8").replace("TimeoutStopSec=300",
-                                                                 "TimeoutStopSec=210"),
-                        encoding="utf-8")
+        # ... and a unit tree whose *effective* stop timeout falls back to the old 210 s is
+        # refused, so the gate is live. The unit ships 210 s and the operator drop-in supplies
+        # 300 s, so the drop-in is what has to be rolled back here.
+        assert "TimeoutStopSec=300" in unit.read_text(encoding="utf-8")
+        dropin = unit.parent / f"{unit.name}.d" / "95-timeout-stop.conf"
+        assert dropin.exists()
+        dropin.write_text("[Service]\nTimeoutStopSec=210\n", encoding="utf-8")
         stale = ctl.verify_manifest(manifest, repo=str(fx["repo"]), install=str(deployed),
                                     launcher=str(fx["launcher"]), phase="post",
                                     expected_post_unit_sha256=sha256(unit),

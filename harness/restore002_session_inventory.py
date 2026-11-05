@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -32,8 +33,21 @@ import release002_control  # noqa: E402  (pinned-blob loader; no gateway import)
 
 PLANNER_PATH = "gateway/session_resume_plan.py"
 
-DB = "/home/hermes/.hermes/state.db"
-INDEX = "/home/hermes/.hermes/sessions/sessions.json"
+def _hermes_home() -> "Path":
+    """The Hermes home the release is operating on, never a hard-coded operator path.
+
+    These defaults used to be the literal production paths, so the inventory read
+    ``/home/hermes/.hermes/state.db`` no matter which home the engine had derived from
+    ``HERMES_RELEASE_HOME``. In production the two agree and nothing showed; in any isolated tree
+    the pre- and post-release inventories described the operator's live sessions instead of the
+    release's own, and a busy live gateway then looked like session drift across the release.
+    """
+    home = os.environ.get("HERMES_HOME") or os.environ.get("HERMES_RELEASE_HOME")
+    return Path(home) if home else Path.home() / ".hermes"
+
+
+DB = str(_hermes_home() / "state.db")
+INDEX = str(_hermes_home() / "sessions" / "sessions.json")
 
 
 def _planner(candidate: str | None, source_repo: str, *, allow_unpinned: bool = False) -> dict:
