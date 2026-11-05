@@ -67,3 +67,21 @@ def test_quiescence_log_reads_the_sample_it_wrote() -> None:
     assert '>"$ARCHIVE/admission-$idx.json"' in loop
     assert '<"$ARCHIVE/admission-$idx.json"' in loop
     assert '<"$ARCHIVE/admission-$quiet.json"' not in loop
+
+
+def test_effective_timeout_honours_the_operator_dropin(tmp_path) -> None:
+    """D-8: the post-release manifest gate compared the unit file's own value, not systemd's."""
+    from harness import release002_control as ctrl
+
+    unit = tmp_path / "hermes-gateway.service"
+    unit.write_text("[Service]\nTimeoutStopSec=210\n")
+    assert ctrl.unit_timeout_stop_seconds(unit) == 210.0
+
+    dropins = tmp_path / "hermes-gateway.service.d"
+    dropins.mkdir()
+    (dropins / "95-timeout-stop.conf").write_text("[Service]\nTimeoutStopSec=300s\n")
+    assert ctrl.unit_timeout_stop_seconds(unit) == 300.0
+
+    # A drop-in that lowers it also wins, exactly as systemd's last-assignment rule.
+    (dropins / "99-lower.conf").write_text("[Service]\nTimeoutStopUSec=5min\n")
+    assert ctrl.unit_timeout_stop_seconds(unit) == 300.0

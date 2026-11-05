@@ -263,18 +263,33 @@ def parse_systemd_duration(text: str) -> Optional[float]:
 
 
 def unit_timeout_stop_seconds(unit_path: "str | Path") -> Optional[float]:
-    """Effective ``TimeoutStopSec=`` of a unit file (the last assignment wins, as systemd does)."""
+    """Effective ``TimeoutStopSec=``, including the ``<unit>.d/*.conf`` drop-ins systemd applies.
+
+    Reading only the unit file reports the value the distributor shipped, which is not the value
+    systemd enforces: an operator drop-in that raises the stop timeout (``95-timeout-stop.conf``)
+    is exactly the supported way to satisfy the 300 s floor, and comparing the unit file's 210 s
+    against a 300 s pin turned every correctly regenerated unit into a NO_GO after a successful
+    deploy. Drop-ins are applied in lexical order and the last assignment wins, as systemd does.
+    """
     text = read_text(Path(unit_path))
     if text is None:
         return None
     found: Optional[float] = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, raw = stripped.partition("=")
-        if key.strip() in ("TimeoutStopSec", "TimeoutStopUSec"):
-            found = parse_systemd_duration(raw)
+    sources = [text]
+    dropin_dir = Path(f"{unit_path}.d")
+    if dropin_dir.is_dir():
+        for conf in sorted(dropin_dir.glob("*.conf")):
+            body = read_text(conf)
+            if body is not None:
+                sources.append(body)
+    for source in sources:
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, raw = stripped.partition("=")
+            if key.strip() in ("TimeoutStopSec", "TimeoutStopUSec"):
+                found = parse_systemd_duration(raw)
     return found
 
 
