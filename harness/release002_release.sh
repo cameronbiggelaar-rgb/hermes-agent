@@ -165,6 +165,9 @@ fi
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ARCHIVE=${ARCHIVE:-/home/hermes/work/HERMES-RESTORE-002/release-$STAMP}
+# The archive is where every preflight sample, manifest and receipt lands; a fresh run id must not
+# make the first redirect fail, which would silently blank the quiescence samples.
+mkdir -p "$ARCHIVE"
 
 LAUNCHER=${HERMES_RELEASE_LAUNCHER:-/usr/local/lib/hermes-release/hermes-release-002}
 MANIFEST=${HERMES_RELEASE_MANIFEST:-/usr/local/lib/hermes-release/manifest.json}
@@ -807,12 +810,22 @@ log "regenerating the unit from the deployed code (no restart)"
 systemctl daemon-reload
 UNIT_TIMEOUT=$(awk -F= '/^TimeoutStopSec=/{print $2}' "$UNIT" | tail -1)
 EFFECTIVE=$(systemctl show "$SERVICE" -p TimeoutStopUSec --value)
+# ``systemctl show --value`` prints the bare value on a real host; some versions and shims keep the
+# property prefix. Strip it so the comparison is about the number, not the formatting.
+EFFECTIVE=${EFFECTIVE#TimeoutStopUSec=}
+EFFECTIVE=${EFFECTIVE#TimeoutStopSec=}
 log "unit TimeoutStopSec=${UNIT_TIMEOUT:-<absent>}  effective TimeoutStopUSec=$EFFECTIVE"
+# The contract is the timeout systemd actually enforces, not the unit file's own assignment: the
+# stock unit ships TimeoutStopSec=210 and the operator drop-in 95-timeout-stop.conf raises it to
+# 300s, so requiring 300 in the regenerated unit would roll back every correctly regenerated unit.
+case "$EFFECTIVE" in
+  300|300s|5min|300000000|"5min 0s") : ;;
+  *) rollback "effective TimeoutStopUSec is '${EFFECTIVE:-absent}', expected 300s (5min)" ;;
+esac
 case "$UNIT_TIMEOUT" in
   300|300s|5min) : ;;
-  *) rollback "generated unit does not carry TimeoutStopSec=300s (got '${UNIT_TIMEOUT:-absent}')" ;;
+  *) log "note: regenerated unit carries TimeoutStopSec=${UNIT_TIMEOUT:-<absent>}; the 300s floor is supplied by the drop-in and verified effective above" ;;
 esac
-[ "$EFFECTIVE" = "5min" ] || rollback "effective TimeoutStopUSec is '$EFFECTIVE', expected 5min"
 POST_UNIT_SHA=$(sha256sum "$UNIT" | cut -d' ' -f1)
 [ -n "$POST_UNIT_SHA" ] || rollback "cannot checksum the regenerated unit"
 journal unit "regenerated unit sha256=$POST_UNIT_SHA effective=$EFFECTIVE" \

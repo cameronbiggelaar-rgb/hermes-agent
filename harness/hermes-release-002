@@ -450,6 +450,8 @@ PYEOF
     --property=WorkingDirectory="$LIB" --property=StandardOutput=append:"$logfile"
     --property=StandardError=append:"$logfile"
     --setenv=HERMES_HOME="$HHOME" --setenv=HERMES_RELEASE_APPROVAL="$CANDIDATE"
+    --setenv=ARCHIVE="$archive"
+    --setenv=HERMES_RELEASE_ARCHIVE="$archive"
     --setenv=HERMES_RELEASE_LAUNCH_TOKEN="$token" --setenv=HERMES_RELEASE_TOKEN_EXPECTED="$token"
     --setenv=HERMES_RELEASE_RUN_ID="$run_id" --setenv=HERMES_RELEASE_JOURNAL="$JOURNAL"
     --setenv=HERMES_RELEASE_INSTALL="$INSTALL" --setenv=HERMES_RELEASE_SOURCE="$REPO"
