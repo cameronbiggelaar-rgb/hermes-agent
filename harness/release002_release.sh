@@ -728,7 +728,8 @@ while [ $SECONDS -lt $deadline ]; do
   # EXT-16: each sample is the full in-freeze gate set (zero agents, zero live admissions for the
   # current epoch, this attempt's freeze ownership, no cron work in flight, no scheduled claim after
   # the freeze, counters consistent). The qualified interval is three consecutive samples, unchanged.
-  if preflight infreeze >"$ARCHIVE/admission-$quiet.json" 2>"$ARCHIVE/admission-$quiet.err"; then
+  idx=$quiet
+  if preflight infreeze >"$ARCHIVE/admission-$idx.json" 2>"$ARCHIVE/admission-$idx.err"; then
     quiet=$((quiet + 1))
   else
     if [ "$quiet" -gt 0 ]; then
@@ -736,7 +737,10 @@ while [ $SECONDS -lt $deadline ]; do
     fi
     quiet=0
   fi
-  log "in-freeze quiescence sample $quiet/3: $(tr -d '\n' <"$ARCHIVE/admission-$quiet.json" 2>/dev/null | grep -o '"failed": \[[^]]*\]' | cut -c1-160 || true)"
+  # Read back the sample this iteration actually wrote. ``quiet`` has already been incremented on
+  # success (and reset on failure), so ``admission-$quiet.json`` names a file that does not exist
+  # yet — the log line then reported ENOENT instead of the gate detail it was meant to show.
+  log "in-freeze quiescence sample $quiet/3: $(tr -d '\n' <"$ARCHIVE/admission-$idx.json" 2>/dev/null | grep -o '"failed": \[[^]]*\]' | cut -c1-160 || true)"
   if [ "$quiet" -ge 3 ]; then break; fi
   sleep 20
 done

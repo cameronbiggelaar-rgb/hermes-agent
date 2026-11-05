@@ -57,3 +57,13 @@ def test_unit_number_mismatch_is_reported_not_fatal() -> None:
     block = text[text.index('case "$UNIT_TIMEOUT" in'):text.index('POST_UNIT_SHA=$(sha256sum')]
     assert "rollback" not in block, "a unit/drop-in split must not roll back"
     assert "drop-in" in block
+
+
+def test_quiescence_log_reads_the_sample_it_wrote() -> None:
+    """D-7: the counter moves before the log line, so the old form opened a file nobody wrote yet."""
+    text = engine()
+    loop = text[text.index("while [ $SECONDS -lt $deadline ]"):text.index("if [ \"$quiet\" -lt 3 ]")]
+    assert "idx=$quiet" in loop
+    assert '>"$ARCHIVE/admission-$idx.json"' in loop
+    assert '<"$ARCHIVE/admission-$idx.json"' in loop
+    assert '<"$ARCHIVE/admission-$quiet.json"' not in loop
