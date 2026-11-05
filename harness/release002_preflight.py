@@ -653,8 +653,12 @@ def main() -> int:
               f"({facts.get('freeze_detail')})")
         # The freeze epoch the caller attributes scheduled work to must be the epoch the marker
         # records. A marker rewritten between engagement and sampling (or a caller that substituted
-        # its own number) would make "no claims after the freeze" meaningless.
-        marker_since = facts.get("drain_marker_requested_at_epoch")
+        # its own number) would make "no claims after the freeze" meaningless. ``freeze_since`` is the
+        # engagement instant; ``requested_at`` moves with the keep-alive, so it is only the fallback
+        # for a marker written before this field existed.
+        marker_since = facts.get("drain_marker_freeze_epoch")
+        if marker_since is None:
+            marker_since = facts.get("drain_marker_requested_at_epoch")
         if args.freeze_since is None or not isinstance(marker_since, (int, float)):
             g.add("freeze_since_attributable", None,
                   f"--freeze-since={args.freeze_since!r} marker={marker_since!r}")

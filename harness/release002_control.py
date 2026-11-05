@@ -907,6 +907,13 @@ def admission_report(*, home: Optional[Path] = None, principal: Optional[str] = 
     if isinstance(marker, dict):
         requested = marker.get("requested_at") or marker.get("updated_at")
     facts["drain_marker_requested_at_epoch"] = _epoch_of(requested)
+    # ``requested_at`` is re-stamped by the freeze keep-alive, so it dates the last refresh, not the
+    # beginning of the freeze. ``freeze_since`` is written once at engagement and is the only field a
+    # caller may attribute scheduled work to.
+    if isinstance(marker, dict):
+        facts["drain_marker_freeze_epoch"] = _epoch_of(marker.get("freeze_since"))
+    else:
+        facts["drain_marker_freeze_epoch"] = None
     facts["freeze_detail"] = freeze["why"]
     estop = estop_state(home, principal=principal)
     facts["estop_present"] = estop["present"]

@@ -312,11 +312,26 @@ freeze_engage() {
   set +e
   FREEZE_SINCE=$(
     cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - "$principal" <<'PYEOF'
-import sys
+import json, os, sys
 from datetime import datetime
-from gateway.drain_control import write_drain_request
+from gateway.drain_control import write_drain_request, drain_request_path
 payload = write_drain_request(principal=sys.argv[1], suppress_notification=True)
-print(int(datetime.fromisoformat(str(payload["requested_at"])).timestamp()))
+# The keep-alive re-stamps ``requested_at`` every 45s, so that field cannot identify when the freeze
+# began. Record the engagement epoch once, beside it, and never move it: a restart or a resumed
+# attempt that finds its own marker keeps the original epoch instead of silently re-dating the
+# freeze and making "no claims after the freeze" meaningless.
+path = drain_request_path()
+with open(path, encoding="utf-8") as fh:
+    body = json.load(fh)
+if not body.get("freeze_since"):
+    body["freeze_since"] = body.get("requested_at") or payload["requested_at"]
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(body, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+print(int(datetime.fromisoformat(str(body["freeze_since"])).timestamp()))
 PYEOF
   ) || { warn "could not write the drain marker"; set -e; return 1; }
   set -e
