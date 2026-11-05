@@ -388,7 +388,8 @@ def _live_freeze_guards(*, install, home):
 def runtime_gate_rows(phase: str, gw_state: dict, pid: int | None, head: str,
                       principal_prefix: str = "release-freeze:", *,
                       principal: str | None = None,
-                      marker_max_age: float | None = None) -> list[tuple]:
+                      marker_max_age: float | None = None,
+                      freeze_since: float | None = None) -> list[tuple]:
     """The phase's runtime-state contract, as data so it can be tested without a live gateway.
 
       ``pre``        the preserved installation is serving: running, not draining, nothing frozen
@@ -408,6 +409,19 @@ def runtime_gate_rows(phase: str, gw_state: dict, pid: int | None, head: str,
     if phase in {"infreeze", "revalidate"}:
         rows.append(("runtime_state_frozen", observed == "draining",
                      f"gateway_state={observed} (in-freeze phase)"))
+        # B: the running gateway must ACKNOWLEDGE this attempt's freeze, not merely leave a
+        # "draining" snapshot behind. gateway_state.json is written on transitions, so a stale
+        # snapshot from an earlier drain would otherwise read as proof of an acknowledgement that
+        # never happened for this attempt.
+        stamp = gw_state.get("updated_at")
+        try:
+            ack_at = datetime.fromisoformat(str(stamp)).timestamp() if stamp else None
+        except (TypeError, ValueError):
+            ack_at = None
+        fresh = (ack_at is not None and freeze_since is not None
+                 and ack_at >= float(freeze_since) - 5.0)
+        rows.append(("gateway_acknowledged_freeze", bool(observed == "draining" and fresh),
+                     f"updated_at={stamp or 'missing'} freeze_since={freeze_since}"))
         rows.append(("admission_freeze_owned", owned, marker["detail"]))
         try:
             estop = json.loads(Path(ESTOP_MARKER).read_text(encoding="utf-8-sig"))
@@ -565,7 +579,8 @@ def main() -> int:
         for name, ok, detail in runtime_gate_rows(args.phase, gw_state, pid, head,
                                                  args.freeze_principal_prefix,
                                                  principal=args.principal if in_freeze else None,
-                                                 marker_max_age=args.marker_max_age if in_freeze else None):
+                                                 marker_max_age=args.marker_max_age if in_freeze else None,
+                                                 freeze_since=args.freeze_since if in_freeze else None):
             g.add(name, ok, detail)
 
     # 5c. Old-runtime admission coverage (EXT-09). The release replaces the running code, so during

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 import subprocess
 import sys
 from pathlib import Path
@@ -413,3 +414,36 @@ def test_marker_freshness_is_bounded(tmp_path):
          "requested_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8")
     report = ctl.admission_report(home=home, principal=PRINCIPAL, marker_max_age=180)
     assert report["facts"]["drain_marker_active"] is False
+
+def test_a_stale_draining_snapshot_is_not_an_acknowledgement(monkeypatch, tmp_path):
+    """B requires the running gateway to acknowledge *this* freeze.
+
+    ``gateway_state.json`` is written on transitions, not periodically, so a "draining" snapshot
+    left behind by an earlier drain would otherwise be read as proof of an acknowledgement that
+    never happened for this attempt. The gate therefore also requires the snapshot to be no older
+    than the freeze epoch.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(pf, "DRAIN_MARKER", str(home / ".drain_request.json"))
+    monkeypatch.setattr(pf, "ESTOP_MARKER", str(home / "ESTOP"))
+    (home / ".drain_request.json").write_text(json.dumps(
+        {"principal": PRINCIPAL, "epoch": ctl._machine_epoch() or "",
+         "requested_at": "2026-11-05T10:00:00+00:00"}), encoding="utf-8")
+    (home / "ESTOP").write_text(json.dumps({"reason": PRINCIPAL}), encoding="utf-8")
+    since = datetime.fromisoformat("2026-11-05T10:00:00+00:00").timestamp()
+
+    def rows(stamp):
+        return {r[0]: r for r in pf.runtime_gate_rows(
+            "infreeze", {"gateway_state": "draining", "updated_at": stamp}, 1, HEAD,
+            principal=PRINCIPAL, marker_max_age=10 ** 9, freeze_since=since)}
+
+    stale = rows("2026-11-05T09:50:00+00:00")          # 20 minutes before the freeze
+    assert stale["runtime_state_frozen"][1] is True    # the state itself still reads "draining"
+    assert stale["gateway_acknowledged_freeze"][1] is False
+
+    fresh = rows("2026-11-05T10:00:02+00:00")          # two seconds after the freeze engaged
+    assert fresh["gateway_acknowledged_freeze"][1] is True
+
+    missing = rows("")
+    assert missing["gateway_acknowledged_freeze"][1] is False
