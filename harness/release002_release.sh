@@ -42,6 +42,7 @@ TIMEOUT_DROPIN=$DROPIN_DIR/95-timeout-stop.conf
 HHOME=${HERMES_HOME:-/home/hermes/.hermes}
 STATE_JSON=$HHOME/gateway_state.json
 ESTOP_FILE=$HHOME/ESTOP
+DRAIN_MARKER=$HHOME/.drain_request.json
 LOCK=/var/lib/hermes-release/restore-002.lock
 JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
 ENGINE_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -64,6 +65,11 @@ ARCHIVE=""
 MUTATED=0
 PHASE=init
 RUN_ID=${HERMES_RELEASE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
+# EXT-16: the freeze principal is this attempt's identity, and it is checked exactly — a marker or
+# ESTOP belonging to any other attempt (including an earlier one that leaked) is never "ours".
+PRINCIPAL="release-freeze:$RUN_ID"
+# Epoch second the freeze was engaged; set by freeze_engage and used to attribute scheduled work.
+FREEZE_SINCE=""
 FROZEN=0
 ESTOP_OURS=0
 KEEPALIVE_PID=""
@@ -169,6 +175,17 @@ preflight() { # $1=phase  [$2=head $3=tree] -> prints JSON, exit 0 only when eve
     pre)  "$PY" "$ENGINE_DIR/release002_preflight.py" --phase pre \
             --expect-head "${2:-$EXPECT_HEAD}" --expect-tree "${3:-$EXPECT_TREE}" \
             --candidate "$CANDIDATE" --source-repo "$SOURCE" ;;
+    infreeze|revalidate)
+          # EXT-16: the only phases allowed to assert quiescence. Exact principal, so a marker or
+          # sentinel owned by another attempt can never be read as this run's freeze; the freeze
+          # epoch, so scheduled work claimed after the freeze is attributable.
+          local since_arg=()
+          if [ -n "${FREEZE_SINCE:-}" ]; then since_arg=(--freeze-since "$FREEZE_SINCE"); else
+            warn "in-freeze preflight without a freeze epoch: scheduled-claim attribution cannot be evaluated"
+          fi
+          "$PY" "$ENGINE_DIR/release002_preflight.py" --phase "$1" --candidate "$CANDIDATE" \
+            --expect-head "$EXPECT_HEAD" --expect-tree "$EXPECT_TREE" --source-repo "$SOURCE" \
+            --principal "$PRINCIPAL" "${since_arg[@]}" ;;
     post|released)
           "$PY" "$ENGINE_DIR/release002_preflight.py" --phase "$1" --candidate "$CANDIDATE" \
             --expect-head "$CANDIDATE" --expect-tree "$CAND_TREE" --source-repo "$SOURCE" ;;
@@ -251,29 +268,62 @@ keepalive_loop() {
 
 estop_is_ours() {
   [ -e "$ESTOP_FILE" ] || return 1
-  env -u PYTHONPATH "$PY3" - "$ESTOP_FILE" <<'PYEOF' >/dev/null 2>&1
+  env -u PYTHONPATH "$PY3" - "$ESTOP_FILE" "$PRINCIPAL" <<'PYEOF' >/dev/null 2>&1
 import json, sys
 try:
     reason = (json.load(open(sys.argv[1])) or {}).get("reason") or ""
 except Exception:
     sys.exit(1)
-sys.exit(0 if reason.startswith("release-freeze:") else 1)
+# Exact identity: a foreign release attempt's ESTOP is not ours to clear, even though it carries the
+# release-freeze: prefix.
+sys.exit(0 if reason == sys.argv[2] else 1)
+PYEOF
+}
+
+drain_is_ours() {
+  [ -e "$DRAIN_MARKER" ] || return 1
+  env -u PYTHONPATH "$PY3" - "$DRAIN_MARKER" "$PRINCIPAL" <<'PYEOF' >/dev/null 2>&1
+import json, sys
+try:
+    body = json.load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(1)
+principal = str(body.get("principal") or body.get("requested_by") or "")
+sys.exit(0 if principal == sys.argv[2] else 1)
 PYEOF
 }
 
 freeze_engage() {
-  local principal="release-freeze:$RUN_ID"
+  local principal="$PRINCIPAL"
   PHASE=freeze
-  if [ -e "$ESTOP_FILE" ]; then
-    log "an ESTOP sentinel already exists; leaving it in place and not claiming it"
+  # EXT-16: a freeze we did not write is never adopted and never overwritten. Adopting a foreign or
+  # stale marker would attribute another attempt's quiescence to this one; clearing it automatically
+  # could release a freeze someone else is relying on. Both are NEEDS_HUMAN.
+  if [ -e "$DRAIN_MARKER" ] && ! drain_is_ours; then
+    warn "NEEDS_HUMAN: a freeze marker already exists and is not owned by $principal; refusing to overwrite it"
+    journal aborted "foreign or stale drain marker; needs a human" 2>/dev/null || true
+    exit 2
   fi
-  ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - "$principal" <<'PYEOF'
+  if [ -e "$ESTOP_FILE" ] && ! estop_is_ours; then
+    warn "NEEDS_HUMAN: an ESTOP sentinel exists and is not owned by $principal; refusing to adopt or clear it"
+    journal aborted "foreign ESTOP sentinel; needs a human" 2>/dev/null || true
+    exit 2
+  fi
+  set +e
+  FREEZE_SINCE=$(
+    cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - "$principal" <<'PYEOF'
 import sys
+from datetime import datetime
 from gateway.drain_control import write_drain_request
 payload = write_drain_request(principal=sys.argv[1], suppress_notification=True)
-print(payload["requested_at"])
+print(int(datetime.fromisoformat(str(payload["requested_at"])).timestamp()))
 PYEOF
-  ) || { warn "could not write the drain marker"; return 1; }
+  ) || { warn "could not write the drain marker"; set -e; return 1; }
+  set -e
+  case "$FREEZE_SINCE" in
+    ''|*[!0-9]*) warn "drain marker written but its timestamp is unusable ('$FREEZE_SINCE'); refusing to guess when the freeze began"
+                 FREEZE_SINCE=""; return 1 ;;
+  esac
   FROZEN=1
   if [ ! -e "$ESTOP_FILE" ]; then
     ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - "$principal" <<'PYEOF'
@@ -306,6 +356,15 @@ freeze_release() {
   rm -f "$ARCHIVE/.freeze-alive"
   if [ -n "$KEEPALIVE_PID" ]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; KEEPALIVE_PID=""; fi
   if [ "$FROZEN" -eq 1 ]; then
+    # EXT-16: exact ownership before the marker is changed. A marker that is present but not ours is
+    # left alone and reported, never cleared — releasing another attempt's freeze is worse than
+    # leaving a freeze in place for a human.
+    if [ -e "$DRAIN_MARKER" ] && ! drain_is_ours; then
+      warn "NEEDS_HUMAN: the drain marker is no longer owned by $PRINCIPAL; leaving it in place"
+      FROZEN=0
+      journal aborted "freeze ownership lost before release; marker left in place" 2>/dev/null || true
+      return 1
+    fi
     ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
 from gateway.drain_control import clear_drain_request
 print("cleared" if clear_drain_request() else "absent")
@@ -314,6 +373,12 @@ PYEOF
     FROZEN=0
   fi
   if [ "$ESTOP_OURS" -eq 1 ]; then
+    if [ -e "$ESTOP_FILE" ] && ! estop_is_ours; then
+      warn "NEEDS_HUMAN: the ESTOP sentinel is no longer owned by $PRINCIPAL; leaving it in place"
+      ESTOP_OURS=0
+      journal aborted "ESTOP ownership lost before release; sentinel left in place" 2>/dev/null || true
+      return 1
+    fi
     ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
 from agent.estop import disengage
 print("cleared" if disengage() else "absent")
@@ -507,25 +572,30 @@ preflight pre "$EXPECT_HEAD" "$EXPECT_TREE" >"$ARCHIVE/preflight-before.json" 2>
 PF_RC=$?
 set -e
 if [ "$MODE" = plan ]; then
-  # A dry-run runs while the gateway is still serving Telegram and cron work, so the quiescence
-  # gates legitimately fail here; they are re-evaluated after the freeze. Print the runbook either
-  # way and keep the exit code honest (2 = the release would refuse in the current state).
+  # EXT-16: the pre-freeze phase is expected to pass on a *busy* gateway — activity gates are
+  # pending, not failed. A dry run still reports the honest exit code, but no longer treats ordinary
+  # traffic as a reason the release could never proceed.
   PHASE=dry-run
   if [ "$PF_RC" -ne 0 ]; then
     log "preflight verdict NO_GO (rc=$PF_RC) in the current state — nothing was changed"
   else
-    log "preflight verdict GO"
+    log "preflight verdict GO (pre-freeze only: quiescence is proven inside the freeze, not here)"
   fi
-  grep -E '"(gate|failed|verdict)"' "$ARCHIVE/preflight-before.json" 2>/dev/null \
+  grep -E '"(gate|failed|pending_gates|verdict)"' "$ARCHIVE/preflight-before.json" 2>/dev/null \
     || cat "$ARCHIVE/preflight-before.err" 2>/dev/null || true
   log "DRY RUN — the following would execute, in this order:"
   cat <<EOF
   1. archive $UNIT + $DROPIN_DIR/*.conf -> $ARCHIVE/unit/ (+ sha256 manifest)
-  2. engage the admission freeze: drain marker (principal release-freeze:$RUN_ID) + ESTOP,
+  2. engage the admission freeze: drain marker (principal $PRINCIPAL) + ESTOP,
      then wait until the live gateway reports gateway_state=draining
-  3. quiesce: three consecutive samples, 20 s apart, of
-     (active_agents == 0) AND (live admissions for the current runtime epoch == 0)
-  4. revalidate install/candidate/unit/drop-in identities immediately before the first mutation
+  2b. refuse to adopt or overwrite a drain marker / ESTOP that this attempt does not own
+     (a foreign or stale freeze is NEEDS_HUMAN, never automatic cleanup)
+  3. quiesce inside the freeze: three consecutive samples, 20 s apart, each running the full
+     in-freeze gate set -- (active_agents == 0) AND (live admissions for the current epoch == 0)
+     AND this attempt still owns the freeze AND no cron execution in flight
+     AND no scheduled claim at/after freeze time AND the two counters agree
+  4. revalidate immediately before the first mutation: install/candidate/unit/drop-in identities,
+     the pre-release manifest, and the same in-freeze gate set (drift fails closed)
   5. git -C $INSTALL merge --ff-only $CANDIDATE   (expects tree $CAND_TREE)
   6. $PY -m hermes_cli.main gateway install --system   (regenerates the unit: TimeoutStopSec=300s)
   7. verify /etc unit TimeoutStopSec == 300s and systemctl show TimeoutStopUSec == 5min
@@ -613,21 +683,37 @@ if [ "$QUIESCE_WAIT" -gt "$MAX_QUIESCE" ]; then
   freeze_release "configuration refused before quiescence"
   exit 65
 fi
+if [ -z "$FREEZE_SINCE" ]; then
+  # Without the freeze epoch, scheduled work claimed during the freeze cannot be attributed and the
+  # in-freeze gates are unevaluable. Abort rather than run a release that cannot prove its own safety.
+  log "refusing: the freeze epoch is unknown; in-freeze quiescence cannot be attributed"
+  freeze_release "freeze epoch unknown"
+  journal aborted "freeze epoch unknown" --result ABORTED_SAFE 2>/dev/null || true
+  receipt "ABORTED_NO_FREEZE_EPOCH" "$ARCHIVE/preflight-before.json"
+  exit 3
+fi
 deadline=$((SECONDS + QUIESCE_WAIT))
 quiet=0
 while [ $SECONDS -lt $deadline ]; do
-  if ct admission --home "$HHOME" >"$ARCHIVE/admission-$quiet.json" 2>/dev/null; then
+  # EXT-16: each sample is the full in-freeze gate set (zero agents, zero live admissions for the
+  # current epoch, this attempt's freeze ownership, no cron work in flight, no scheduled claim after
+  # the freeze, counters consistent). The qualified interval is three consecutive samples, unchanged.
+  if preflight infreeze >"$ARCHIVE/admission-$quiet.json" 2>"$ARCHIVE/admission-$quiet.err"; then
     quiet=$((quiet + 1))
   else
+    if [ "$quiet" -gt 0 ]; then
+      log "in-freeze sample failed after $quiet passing sample(s) — the quiet interval restarts"
+    fi
     quiet=0
   fi
-  log "admission sample $quiet/3: $(ct admission --home "$HHOME" 2>/dev/null | tr -d '\n' | cut -c1-160 || true)"
+  log "in-freeze quiescence sample $quiet/3: $(tr -d '\n' <"$ARCHIVE/admission-$quiet.json" 2>/dev/null | grep -o '"failed": \[[^]]*\]' | cut -c1-160 || true)"
   if [ "$quiet" -ge 3 ]; then break; fi
   sleep 20
 done
-journal quiesce "quiet samples=$quiet"
+journal quiesce "quiet samples=$quiet freeze_since=$FREEZE_SINCE principal=$PRINCIPAL"
 if [ "$quiet" -lt 3 ]; then
   log "no quiescent window within ${QUIESCE_WAIT}s — aborting before any mutation"
+  tail -40 "$ARCHIVE/admission-0.err" 2>/dev/null || true
   freeze_release "not quiet within ${QUIESCE_WAIT}s"
   journal aborted "not quiet within ${QUIESCE_WAIT}s" --result ABORTED_SAFE 2>/dev/null || true
   receipt "ABORTED_NOT_QUIET" "$ARCHIVE/preflight-before.json"
@@ -647,13 +733,27 @@ UNIT_SHA_NOW=$(sha256sum "$UNIT" | cut -d' ' -f1)
 [ -z "$DIRTY" ] || abort_before_mutation revalidate "install worktree became dirty"
 [ "$UNIT_SHA_NOW" = "$(cut -d' ' -f1 "$ARCHIVE/unit/SHA256SUMS" | head -1)" ] \
   || abort_before_mutation revalidate "unit file changed between archive and mutation"
+# EXT-16: freeze ownership is re-proven here by the shell itself, not only by the preflight payload,
+# so a marker that changed hands between the last quiesce sample and the merge fails closed.
+drain_is_ours || abort_before_mutation revalidate "admission is not frozen by this attempt ($PRINCIPAL)"
+estop_is_ours || abort_before_mutation revalidate "admission is not frozen: ESTOP is not held by this attempt ($PRINCIPAL)"
 set +e
 manifest_verify pre >"$ARCHIVE/manifest-revalidate.json" 2>&1
 MF2=$?
 set -e
 [ "$MF2" -eq 0 ] || abort_before_mutation revalidate "pre-release manifest identities no longer hold"
-ct admission --home "$HHOME" >"$ARCHIVE/admission-pre-mutation.json" 2>/dev/null \
-  || abort_before_mutation revalidate "admission is not frozen/quiescent"
+# EXT-16: the same in-freeze gate set as the quiesce samples, re-evaluated immediately before the
+# first mutation, so drift in admission state, freeze ownership, scheduled work or identities between
+# the last quiesce sample and the merge fails closed.
+set +e
+preflight revalidate >"$ARCHIVE/preflight-revalidate.json" 2>"$ARCHIVE/preflight-revalidate.err"
+PF3=$?
+set -e
+if [ "$PF3" -ne 0 ]; then
+  tail -40 "$ARCHIVE/preflight-revalidate.err" 2>/dev/null || true
+  grep -E '"(gate|failed|verdict)"' "$ARCHIVE/preflight-revalidate.json" 2>/dev/null || true
+  abort_before_mutation revalidate "in-freeze revalidation NO_GO (rc=$PF3)"
+fi
 journal revalidate "identities and admission revalidated immediately before mutation"
 
 # ------------------------------------------------------------------- phase 5: deploy

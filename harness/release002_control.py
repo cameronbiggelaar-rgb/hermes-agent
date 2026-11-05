@@ -747,22 +747,44 @@ def _machine_epoch() -> str:
     return f"{boot}:{pid1}" if (boot or pid1) else ""
 
 
-def marker_state(marker: Any, *, now: Optional[float] = None) -> dict[str, Any]:
+def _epoch_of(stamp: Any) -> Optional[float]:
+    """ISO-8601 or numeric timestamp -> epoch seconds; None when absent or unparseable."""
+    if stamp is None or stamp == "":
+        return None
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+        return float(stamp)
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def marker_state(marker: Any, *, now: Optional[float] = None,
+                 max_age: float = DRAIN_MAX_AGE_SECONDS,
+                 principal: Optional[str] = None) -> dict[str, Any]:
     """Is *marker* a live release freeze? Same activeness rule the gateway applies, plus the
     release's own principal namespace, so an operator drain or a leaked marker cannot be reported
     as "the freeze is engaged".
 
+    ``principal`` (EXT-16) switches the namespace test to **exact ownership**: the marker must name
+    this attempt, not merely some release freeze. A stale, foreign or ambiguous marker is never
+    "owned", and ``why`` says which.
+
     Lenient where the gateway is lenient: a marker with no ``requested_at``/``epoch`` is accepted
-    (legacy shape) rather than treated as absent.
+    (legacy shape) rather than treated as absent. ``max_age`` is the caller's freshness budget.
     """
     now = time.time() if now is None else now
     if marker is None:
         return {"present": False, "active": False, "why": "absent"}
     if not isinstance(marker, dict):
         return {"present": True, "active": False, "why": "unreadable"}
-    principal = str(marker.get("principal") or "")
-    if not principal.startswith(FREEZE_PRINCIPAL_PREFIX):
-        return {"present": True, "active": False, "why": f"principal {principal!r} is not a release freeze"}
+    observed = str(marker.get("principal") or "")
+    if principal is not None:
+        if observed != principal:
+            return {"present": True, "active": False,
+                    "why": f"principal {observed!r} is not this attempt ({principal!r})"}
+    elif not observed.startswith(FREEZE_PRINCIPAL_PREFIX):
+        return {"present": True, "active": False, "why": f"principal {observed!r} is not a release freeze"}
     epoch = marker.get("epoch")
     mine = _machine_epoch()
     if epoch and mine and str(epoch) != mine:
@@ -774,16 +796,91 @@ def marker_state(marker: Any, *, now: Optional[float] = None) -> dict[str, Any]:
         age = now - datetime.fromisoformat(str(stamp)).timestamp()
     except (TypeError, ValueError):
         return {"present": True, "active": True, "why": "unparsable requested_at"}
-    if age > DRAIN_MAX_AGE_SECONDS:
-        return {"present": True, "active": False, "why": f"expired ({age / 60:.0f} min old)"}
-    return {"present": True, "active": True, "why": "fresh"}
+    if age > max_age:
+        return {"present": True, "active": False, "why": f"expired ({age:.0f}s old, budget {max_age:.0f}s)"}
+    return {"present": True, "active": True, "why": f"fresh ({age:.0f}s old)"}
 
 
-def admission_report(*, home: Optional[Path] = None) -> dict[str, Any]:
+def estop_state(home: Optional[Path] = None, *, principal: Optional[str] = None) -> dict[str, Any]:
+    """Whether the ESTOP sentinel exists and whether *this attempt* owns it.
+
+    The sentinel has no writer-side ownership field beyond ``reason``, so exact ownership can only
+    be asserted when the caller names its principal (``release-freeze:<attempt>``). Without one,
+    ``owned`` means "a release freeze owns it" — used for refusal, never for release.
+    """
+    path = estop_marker_path(home)
+    try:
+        present = path.exists()
+    except OSError:
+        return {"present": True, "owned": False, "reason": None, "why": "sentinel stat failed"}
+    if not present:
+        return {"present": False, "owned": False, "reason": None, "why": "absent"}
+    body = _read_json(path)
+    reason = body.get("reason") if isinstance(body, dict) else None
+    observed = str(reason or "")
+    owned = (observed == principal) if principal is not None else observed.startswith(FREEZE_PRINCIPAL_PREFIX)
+    return {"present": True, "owned": owned, "reason": reason,
+            "why": ("this attempt" if owned else f"reason {observed!r} is not this attempt")}
+
+
+def cron_report(home: Optional[Path] = None, *, since: Optional[float] = None) -> dict[str, Any]:
+    """Scheduled-work evidence at a freeze boundary: in-flight executions and post-freeze claims.
+
+    Read-only. An absent database means no scheduler ever ran (zero executions); an *unreadable*
+    database is ``evaluable=False`` so the in-freeze gate fails closed. ``since`` is the epoch
+    second the freeze was engaged: any row claimed at/after it proves a producer admitted work
+    after the freeze, which is precisely what must not happen.
+    """
+    import sqlite3
+    home = home or hermes_home()
+    db = Path(home) / "cron" / "executions.db"
+    if not db.exists():
+        return {"evaluable": True, "inflight": 0, "post_freeze_claims": 0,
+                "detail": f"no executions database at {db}"}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        return {"evaluable": False, "inflight": None, "post_freeze_claims": None,
+                "detail": f"executions db unreadable: {exc}"}
+    try:
+        conn.execute("PRAGMA query_only=1")
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+        if not {"status", "claimed_at"} <= cols:
+            return {"evaluable": False, "inflight": None, "post_freeze_claims": None,
+                    "detail": f"unexpected executions schema: {sorted(cols)}"}
+        inflight = conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE status IN ('claimed','running')").fetchone()[0]
+        post = 0
+        if since is not None:
+            rows = conn.execute(
+                "SELECT claimed_at FROM executions WHERE status IN ('claimed','running')").fetchall()
+            for (stamp,) in rows:
+                try:
+                    if datetime.fromisoformat(str(stamp)).timestamp() >= since:
+                        post += 1
+                except (TypeError, ValueError):
+                    post += 1      # cannot date it: count as unsafe, never as safe
+    except sqlite3.Error as exc:
+        return {"evaluable": False, "inflight": None, "post_freeze_claims": None,
+                "detail": f"executions db query failed: {exc}"}
+    finally:
+        conn.close()
+    return {"evaluable": True, "inflight": int(inflight), "post_freeze_claims": int(post),
+            "detail": f"inflight={inflight} claims_at_or_after_freeze={post}"}
+
+
+def admission_report(*, home: Optional[Path] = None, principal: Optional[str] = None,
+                     marker_max_age: float = DRAIN_MAX_AGE_SECONDS,
+                     require_estop: bool = True) -> dict[str, Any]:
     """Prove the freeze is engaged and nothing admitted is still executing.
 
     Fails closed: a state file that cannot be read, an unreadable database, or an unknown epoch is
     ``ok=False`` with an ``unevaluable`` reason — never "probably idle".
+
+    EXT-16: ``principal`` demands **exact** ownership of both controls (the drain marker principal
+    and the ESTOP reason). ``marker_max_age`` bounds marker freshness so a leaked marker inherited
+    from an earlier attempt cannot be reported as this run's freeze. A zero counter beside a
+    non-zero one is reported as ``admission_counters_contradict`` rather than quietly believed.
     """
     home = home or hermes_home()
     reasons: list[str] = []
@@ -799,13 +896,22 @@ def admission_report(*, home: Optional[Path] = None) -> dict[str, Any]:
         facts["updated_at"] = state.get("updated_at")
 
     marker = _read_json(drain_marker_path(home))
-    freeze = marker_state(marker)
+    freeze = marker_state(marker, max_age=marker_max_age, principal=principal)
     facts["drain_marker_present"] = drain_marker_path(home).exists()
     facts["drain_marker_active"] = freeze["active"]
     facts["drain_marker_principal"] = (marker or {}).get("principal") if isinstance(marker, dict) else None
     facts["drain_marker_epoch"] = (marker or {}).get("epoch") if isinstance(marker, dict) else None
+    # Epoch second of the marker's own timestamp, parsed with the same rules the freshness check uses;
+    # None when absent or unparseable, so a caller can never attribute scheduled work to a guess.
+    requested = None
+    if isinstance(marker, dict):
+        requested = marker.get("requested_at") or marker.get("updated_at")
+    facts["drain_marker_requested_at_epoch"] = _epoch_of(requested)
     facts["freeze_detail"] = freeze["why"]
-    facts["estop_present"] = estop_marker_path(home).exists()
+    estop = estop_state(home, principal=principal)
+    facts["estop_present"] = estop["present"]
+    facts["estop_owned"] = estop["owned"]
+    facts["estop_reason"] = estop["reason"]
 
     db = state_db_path(home)
     epoch = current_epoch(db)
@@ -830,10 +936,20 @@ def admission_report(*, home: Optional[Path] = None) -> dict[str, Any]:
         reasons.append(f"active_agents={facts['active_agents']}")
     if type(facts.get("live_admissions")) is int and facts["live_admissions"] > 0:
         reasons.append(f"live_admissions={facts['live_admissions']}")
+    agents = facts.get("active_agents")
+    live = facts.get("live_admissions")
+    if type(agents) is int and type(live) is int and (agents == 0) != (live == 0):
+        # Work is either counted as an agent, an admission, or both. One zero beside a non-zero is
+        # an accounting fault — the release must stop and ask, never pick the friendlier number.
+        reasons.append("admission_counters_contradict")
     if not facts["drain_marker_active"]:
         reasons.append("freeze_not_engaged")
-    if not facts["estop_present"]:
+    if require_estop and not estop["present"]:
         reasons.append("estop_not_engaged")
+    elif require_estop and principal is not None and not estop["owned"]:
+        reasons.append("estop_foreign_owner")
+    elif require_estop and principal is None and not estop["owned"]:
+        reasons.append("estop_not_owned_by_release")
     evaluable = not any(r.endswith("_unevaluable") or r == "gateway_state_unreadable" for r in reasons)
     return {"ok": not reasons, "evaluable": evaluable, "reasons": reasons, "facts": facts,
             "mechanisms": list(FREEZE_MECHANISMS)}

@@ -282,7 +282,10 @@ def make_home(tmp_path: Path, *, epoch: int | None = 7, agents: int | None = 0,
     if marker is not None:
         (home / ".drain_request.json").write_text(json.dumps(marker), encoding="utf-8")
     if estop:
-        (home / "ESTOP").write_text("release-freeze:test\n", encoding="utf-8")
+        # Production format: agent.estop.engage() writes {"engaged_at", "reason"} JSON, and ownership
+        # of the sentinel is its `reason` — exact principal for this attempt.
+        (home / "ESTOP").write_text(
+            json.dumps({"engaged_at": _iso(4), "reason": "release-freeze:test"}), encoding="utf-8")
     return home
 
 

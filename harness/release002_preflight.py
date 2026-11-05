@@ -37,6 +37,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -50,12 +53,20 @@ HERMES_HOME = os.environ.get("HERMES_RELEASE_HOME") or "/home/hermes/.hermes"
 INSTALL = os.environ.get("HERMES_RELEASE_INSTALL") or f"{HERMES_HOME}/hermes-agent"
 SERVICE = "hermes-gateway.service"
 UNIT_DIR = "/etc/systemd/system"
+# EXT-16 qualification hook, identical in shape to the engine's HERMES_RELEASE_QUALIFY_UNIT: a
+# temporary unit directory is only honoured with the explicit flag, so no environment can silently
+# redirect a production release's unit or drop-in checks.
+if os.environ.get("HERMES_RELEASE_QUALIFY") == "1" and os.environ.get("HERMES_RELEASE_QUALIFY_UNIT"):
+    _qualify_unit = os.environ["HERMES_RELEASE_QUALIFY_UNIT"]
+    UNIT_DIR = os.path.dirname(_qualify_unit)
+    SERVICE = os.path.basename(_qualify_unit)
 HOLD_DROPIN = f"{UNIT_DIR}/{SERVICE}.d/90-recovery-hold.conf"
 TIMEOUT_DROPIN = f"{UNIT_DIR}/{SERVICE}.d/95-timeout-stop.conf"
 DB = f"{HERMES_HOME}/state.db"
 INDEX = f"{HERMES_HOME}/sessions/sessions.json"
 GW_STATE = f"{HERMES_HOME}/gateway_state.json"
 DRAIN_MARKER = f"{HERMES_HOME}/.drain_request.json"
+ESTOP_MARKER = f"{HERMES_HOME}/ESTOP"
 
 # Expected identities. e05128fe is the verified RESTORE-001 installation the owner ordered preserved;
 # the release replaces it with the qualified Fault B commit, so the *candidate* is passed in.
@@ -70,18 +81,35 @@ class Gates:
     def __init__(self) -> None:
         self.rows: list[dict] = []
 
-    def add(self, name: str, ok: bool | None, detail: str, *, critical: bool = True) -> None:
-        self.rows.append({"gate": name, "ok": ok, "critical": critical, "detail": detail})
+    def add(self, name: str, ok: bool | None, detail: str, *, critical: bool = True,
+            deferred: bool = False) -> None:
+        """Record one gate.
+
+        ``deferred`` (EXT-16) marks a gate that this phase is not yet allowed to evaluate — a
+        quiescence check before the admission freeze exists. It is neither a pass nor a failure: it
+        is reported as ``status="pending"``, excluded from ``failed``, and named in
+        ``pending_gates``. Manufacturing a pass for it would let a busy gateway look deployable.
+        """
+        self.rows.append({"gate": name, "ok": ok, "critical": critical, "detail": detail,
+                          "deferred": bool(deferred),
+                          "status": "pending" if deferred else ("pass" if ok is True else
+                                                               "fail" if ok is False else "unevaluable")})
 
     @property
     def failed(self) -> list[dict]:
-        return [r for r in self.rows if r["critical"] and r["ok"] is not True]
+        return [r for r in self.rows
+                if r["critical"] and r["ok"] is not True and not r["deferred"]]
+
+    @property
+    def pending(self) -> list[str]:
+        return [r["gate"] for r in self.rows if r["deferred"]]
 
     def emit(self) -> int:
         payload = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "gates": self.rows,
             "failed": [r["gate"] for r in self.failed],
+            "pending_gates": self.pending,
             "verdict": "GO" if not self.failed else "NO_GO",
         }
         print(json.dumps(payload, indent=2))
@@ -166,8 +194,14 @@ def unit_timeout_sec() -> float | None:
     return parse_systemd_duration(props.get("TimeoutStopUSec", ""))
 
 
-def _drain_marker(principal_prefix: str) -> dict:
-    """Read the freeze marker without importing gateway code into this process."""
+def _drain_marker(principal_prefix: str, *, principal: str | None = None,
+                  max_age: float | None = None) -> dict:
+    """Read the freeze marker without importing gateway code into this process.
+
+    ``principal`` (EXT-16) demands exact ownership; the prefix test remains for the post-release
+    phase, where the marker must be *some* release freeze. ``max_age`` rejects a marker inherited
+    from an earlier attempt even when its principal happens to match (a leaked attempt id).
+    """
     path = DRAIN_MARKER
     try:
         with open(path, encoding="utf-8") as fh:
@@ -176,15 +210,36 @@ def _drain_marker(principal_prefix: str) -> dict:
         return {"present": False, "ok": False, "detail": f"no freeze marker at {path}"}
     except Exception as exc:
         return {"present": True, "ok": False, "detail": f"{path} unreadable: {exc}"}
-    principal = str(body.get("principal") or body.get("requested_by") or "")
-    owned = principal.startswith(principal_prefix)
+    observed = str(body.get("principal") or body.get("requested_by") or "")
+    owned = (observed == principal) if principal is not None else observed.startswith(principal_prefix)
     age = None
+    raw = body.get("requested_at") or body.get("updated_at")
     try:
-        age = time.time() - float(body.get("requested_at") or body.get("updated_at") or 0)
+        if isinstance(raw, (int, float)):
+            age = time.time() - float(raw)
+        elif raw:
+            age = time.time() - datetime.fromisoformat(str(raw)).timestamp()
     except (TypeError, ValueError):
         age = None
-    detail = f"principal={principal or 'absent'} owned_by_release_freeze={owned} age_s={age}"
-    return {"present": True, "ok": owned, "detail": detail, "principal": principal, "age_s": age}
+    stale = age is not None and max_age is not None and age > max_age
+    detail = (f"principal={observed or 'absent'} owned_by_this_attempt={owned} age_s="
+              f"{'unknown' if age is None else f'{age:.0f}'}"
+              + (f" stale_budget_s={max_age:.0f}" if max_age is not None else ""))
+    return {"present": True, "ok": owned and not stale, "detail": detail, "principal": observed,
+            "age_s": age, "stale": stale}
+
+
+def _stamp(raw: Any) -> float:
+    """Epoch seconds from a gateway_state timestamp, ISO or numeric. Unparsable -> 0.0 (maximally
+    stale) so a quiet-window check can never be satisfied by a timestamp it cannot read."""
+    try:
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if raw:
+            return datetime.fromisoformat(str(raw)).timestamp()
+    except (TypeError, ValueError):
+        pass
+    return 0.0
 
 
 def main_pid() -> int | None:
@@ -298,29 +353,88 @@ def db_stats() -> dict:
     return stats
 
 
+def _live_freeze_guards(*, install, home):
+    """Ask the deployed modules, in the installation's own interpreter, whether the two mechanisms
+    the producer paths consult are engaged *in the live HERMES_HOME*.
+
+    This is the difference between "a marker file exists" and "the code that refuses a message, a
+    cron tick, a wake or an RPC will actually refuse": the readers are the deployed ones, reading
+    the same paths the running gateway reads. Read-only — nothing is engaged, cleared or rewritten.
+    """
+    code = (
+        "import json, logging\n"
+        "import gateway.drain_control as d, agent.estop as e\n"
+        "print(json.dumps({'drain_requested': bool(d.drain_requested()),\n"
+        "                  'estop_engaged': bool(e.is_engaged()),\n"
+        "                  'estop_check_paused': bool(e.check_paused('release-preflight', logging.getLogger('release-preflight')))}))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["HERMES_HOME"] = str(home)
+    try:
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(install), env=env,
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "detail": f"probe could not run: {exc}"}
+    if proc.returncode != 0:
+        return {"ok": False, "detail": f"probe failed rc={proc.returncode}: {proc.stderr.strip()[-300:]}"}
+    try:
+        body = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "detail": f"probe output unreadable: {proc.stdout.strip()[-200:]}"}
+    ok = all(body.get(k) is True for k in ("drain_requested", "estop_engaged", "estop_check_paused"))
+    return {"ok": ok, "detail": body}
+
+
 def runtime_gate_rows(phase: str, gw_state: dict, pid: int | None, head: str,
-                      principal_prefix: str = "release-freeze:") -> list[tuple]:
+                      principal_prefix: str = "release-freeze:", *,
+                      principal: str | None = None,
+                      marker_max_age: float | None = None) -> list[tuple]:
     """The phase's runtime-state contract, as data so it can be tested without a live gateway.
 
-      ``pre``       the preserved installation is serving: running, not draining, nothing frozen
-      ``post``      the release holds its own freeze across the restart: draining, marker owned
-      ``released``  the release finished: candidate running, no freeze left behind
-      ``any``       structural only (pid/code checks), state not asserted
+      ``pre``        the preserved installation is serving: running, not draining, nothing frozen
+      ``infreeze``   this attempt holds the freeze: draining, marker + ESTOP owned by this attempt
+      ``revalidate`` identical to ``infreeze`` (checked again immediately before mutation)
+      ``post``       the release holds its own freeze across the restart: draining, marker owned
+      ``released``   the release finished: candidate running, no freeze left behind
+      ``any``        structural only (pid/code checks), state not asserted
+
+    ``principal`` (EXT-16) upgrades "a release freeze owns it" to "this attempt owns it". The
+    pre-freeze phase never asserts quiescence; that is the caller's deferred gate.
     """
     rows: list[tuple] = []
     observed = gw_state.get("gateway_state")
-    marker = _drain_marker(principal_prefix)
-    if phase == "post":
+    marker = _drain_marker(principal_prefix, principal=principal, max_age=marker_max_age)
+    owned = bool(marker["ok"]) and (principal is None or marker.get("principal") == principal)
+    if phase in {"infreeze", "revalidate"}:
+        rows.append(("runtime_state_frozen", observed == "draining",
+                     f"gateway_state={observed} (in-freeze phase)"))
+        rows.append(("admission_freeze_owned", owned, marker["detail"]))
+        try:
+            estop = json.loads(Path(ESTOP_MARKER).read_text(encoding="utf-8-sig"))
+            reason = str((estop or {}).get("reason") or "") if isinstance(estop, dict) else ""
+        except FileNotFoundError:
+            reason = ""
+        except Exception as exc:  # noqa: BLE001 - unreadable sentinel is not ownership
+            reason = ""
+            marker = dict(marker, detail=marker["detail"] + f"; ESTOP unreadable: {exc}")
+        want = principal if principal is not None else f"{principal_prefix}{'*'}"
+        estop_ok = reason == principal if principal is not None else reason.startswith(principal_prefix)
+        rows.append(("estop_owned_by_attempt", estop_ok,
+                     f"reason={reason or 'absent'} expected={want}"))
+    elif phase == "post":
         # EXT-06: a correct post-release check runs *inside* the freeze it engaged. Requiring
         # "running" here would make a correct release unverifiable; accepting either would let a
         # verification pass with the service stopped. Draining + owned marker is the real contract.
         rows.append(("runtime_state_frozen", observed == "draining",
                      f"gateway_state={observed} (post-release verification runs inside the freeze)"))
-        rows.append(("admission_freeze_held", marker["ok"], marker["detail"]))
+        rows.append(("admission_freeze_held", owned, marker["detail"]))
     elif phase in {"pre", "released"}:
         rows.append(("runtime_state_running", observed == "running",
                      f"gateway_state={observed} exit_reason={gw_state.get('exit_reason')}"))
         rows.append(("no_preexisting_freeze", not marker["present"], marker["detail"]))
+        if phase == "pre":
+            rows.append(("no_preexisting_estop", not Path(ESTOP_MARKER).exists(),
+                         f"{ESTOP_MARKER} present={Path(ESTOP_MARKER).exists()}"))
     rows.append(("runtime_state_pid_matches", gw_state.get("pid") == pid,
                  f"state pid={gw_state.get('pid')} systemd MainPID={pid}"))
     rows.append(("runtime_code_sha_matches_install", gw_state.get("code_sha") == head,
@@ -339,19 +453,40 @@ def main() -> int:
                     help="repository holding the candidate (default: the installation); the pinned "
                          "session planner is read from this repo's git objects, never from an import")
     ap.add_argument("--quiet-window", type=float, default=QUIET_WINDOW_S)
-    ap.add_argument("--phase", choices=["pre", "post", "released", "any"], default="pre",
-                    help="pre = before any mutation (gateway running); post = after the restart, "
-                         "with this run's admission freeze still engaged (gateway draining)")
+    ap.add_argument("--phase", choices=["pre", "infreeze", "revalidate", "post", "released", "any"],
+                    default="pre",
+                    help="pre = before the freeze (never asserts quiescence); infreeze = after the "
+                         "admission freeze, proving quiescence; revalidate = again immediately before "
+                         "mutation; post = after the restart with this run's freeze still engaged; "
+                         "released = freeze lifted and the candidate serving")
     ap.add_argument("--freeze-principal-prefix", default="release-freeze:",
                     help="post phase: the drain marker must be owned by a release freeze")
+    ap.add_argument("--principal", default=None,
+                    help="this attempt's exact freeze principal (release-freeze:<attempt>); required by "
+                         "infreeze/revalidate so a foreign or leaked marker is never mistaken for ours")
+    ap.add_argument("--marker-max-age", type=float, default=180.0,
+                    help="seconds a freeze marker stays credible (in-freeze phases); a stale marker "
+                         "from an earlier attempt fails closed")
+    ap.add_argument("--freeze-since", type=float, default=None,
+                    help="epoch second the freeze was engaged; cron work claimed at/after it is a "
+                         "producer leak and fails the in-freeze phase")
     ap.add_argument("--skip-oldgate", action="store_true",
                     help="developer dry runs only; the release engine never passes it")
     args = ap.parse_args()
+    in_freeze = args.phase in {"infreeze", "revalidate"}
     post = args.phase in {"post", "released"}
-    if post and not args.candidate:
+    if (post or in_freeze) and not args.candidate:
         print(json.dumps({"phase": args.phase, "verdict": "NO_GO",
-                          "failed": ["post_phase_requires_candidate"],
-                          "detail": "--phase post needs the exact --candidate"}, indent=2))
+                          "failed": [f"{args.phase}_phase_requires_candidate"],
+                          "detail": f"--phase {args.phase} needs the exact --candidate"}, indent=2))
+        return 2
+    if in_freeze and not args.principal:
+        # Without an exact principal the phase cannot distinguish this attempt's freeze from a
+        # foreign one, and "someone else's drain marker" would read as quiescence.
+        print(json.dumps({"phase": args.phase, "verdict": "NO_GO",
+                          "failed": ["in_freeze_phase_requires_principal"],
+                          "detail": "--phase infreeze/revalidate needs --principal release-freeze:<attempt>"},
+                         indent=2))
         return 2
 
     g = Gates()
@@ -428,13 +563,15 @@ def main() -> int:
     g.add("runtime_state_readable", "error" not in gw_state, gw_state.get("error", "gateway_state.json"))
     if "error" not in gw_state:
         for name, ok, detail in runtime_gate_rows(args.phase, gw_state, pid, head,
-                                                 args.freeze_principal_prefix):
+                                                 args.freeze_principal_prefix,
+                                                 principal=args.principal if in_freeze else None,
+                                                 marker_max_age=args.marker_max_age if in_freeze else None):
             g.add(name, ok, detail)
 
     # 5c. Old-runtime admission coverage (EXT-09). The release replaces the running code, so during
     # the cutover the protection in force is the *deployed* drain/ESTOP machinery, not the guard the
     # candidate ships. Proving it here means the freeze engages something that already refuses.
-    if args.phase != "pre":
+    if args.phase in {"post", "released"}:
         g.add("old_runtime_coverage", True,
               "not applicable once the restart has happened (the candidate's admission guard is live)",
               critical=False)
@@ -473,11 +610,66 @@ def main() -> int:
               + (f" ({', '.join(state['recently_active'][:5])})" if state["recently_active"] else ""),
               critical=False)
 
-    # 6b. No engineering turn may be cut. The gateway drains its own active agents, but an
-    # agent still streaming a turn is exactly what the owner asked us to prove absent.
-    active_agents = gw_state.get("active_agents")
-    g.add("no_active_turns", active_agents == 0,
-          f"gateway_state.active_agents={active_agents!r}")
+    # 6b. Quiescence is only *provable* inside a freeze. Before the freeze these gates are emitted as
+    # pending — never as passes — because admission_report() requires the drain marker that only
+    # phase B creates. The old driver evaluated them in `pre` and could therefore never reach GO on a
+    # gateway carrying traffic (EXT-16 ordering defect).
+    QUIESCENCE_GATES = ("no_active_agents", "no_live_admissions", "admission_counters_consistent",
+                        "freeze_owned_by_attempt", "freeze_since_attributable",
+                        "freeze_guards_engaged", "cron_inflight_zero",
+                        "cron_no_claims_after_freeze", "quiet_window_elapsed")
+    if in_freeze:
+        adm = release002_control.admission_report(
+            principal=args.principal, marker_max_age=args.marker_max_age)
+        facts = adm["facts"]
+        reasons = adm["reasons"]
+        agents, live = facts.get("active_agents"), facts.get("live_admissions")
+        g.add("no_active_agents", agents == 0 if type(agents) is int else None,
+              f"gateway_state.active_agents={agents!r}")
+        g.add("no_live_admissions", live == 0 if type(live) is int else None,
+              f"live_admissions={live!r} epoch={facts.get('epoch')} "
+              f"stale={facts.get('stale_admissions')!r}")
+        g.add("admission_counters_consistent", "admission_counters_contradict" not in reasons,
+              f"active_agents={agents!r} live_admissions={live!r}")
+        g.add("freeze_owned_by_attempt",
+              facts.get("drain_marker_active") is True and "estop_foreign_owner" not in reasons
+              and "estop_not_owned_by_release" not in reasons,
+              f"marker={facts.get('drain_marker_principal')!r} estop={facts.get('estop_reason')!r} "
+              f"({facts.get('freeze_detail')})")
+        # The freeze epoch the caller attributes scheduled work to must be the epoch the marker
+        # records. A marker rewritten between engagement and sampling (or a caller that substituted
+        # its own number) would make "no claims after the freeze" meaningless.
+        marker_since = facts.get("drain_marker_requested_at_epoch")
+        if args.freeze_since is None or not isinstance(marker_since, (int, float)):
+            g.add("freeze_since_attributable", None,
+                  f"--freeze-since={args.freeze_since!r} marker={marker_since!r}")
+        else:
+            skew = abs(float(marker_since) - float(args.freeze_since))
+            g.add("freeze_since_attributable", skew <= 5.0,
+                  f"marker_epoch={float(marker_since):.0f} caller={float(args.freeze_since):.0f} "
+                  f"skew={skew:.1f}s")
+        # Both mechanisms as the *deployed code* reads them, not just as files on disk.
+        guards = _live_freeze_guards(install=Path(INSTALL), home=Path(HERMES_HOME))
+        g.add("freeze_guards_engaged", guards["ok"], str(guards["detail"]))
+        cron = release002_control.cron_report(since=args.freeze_since)
+        g.add("cron_inflight_zero", cron["inflight"] == 0 if cron["evaluable"] else None, cron["detail"])
+        if args.freeze_since is None:
+            # Not knowing when the freeze began means post-freeze claims cannot be attributed; the
+            # gate is unevaluable and the phase is NO_GO rather than "probably fine".
+            g.add("cron_no_claims_after_freeze", None,
+                  "no --freeze-since supplied: claims cannot be attributed to before/after the freeze")
+        else:
+            g.add("cron_no_claims_after_freeze",
+                  cron["post_freeze_claims"] == 0 if cron["evaluable"] else None, cron["detail"])
+        if "error" in gw_state:
+            g.add("quiet_window_elapsed", None, "gateway_state unreadable; cannot date the last activity")
+        else:
+            since_last = time.time() - _stamp(gw_state.get("updated_at") or gw_state.get("last_activity_at"))
+            g.add("quiet_window_elapsed", since_last >= args.quiet_window,
+                  f"since_last_activity={since_last:.0f}s window={args.quiet_window:.0f}s")
+    else:
+        for name in QUIESCENCE_GATES:
+            g.add(name, None, "pending: only evaluable inside the admission freeze", deferred=True)
 
     # 7. Gateway children: a busy gateway owns tool subprocesses; a quiet one owns few.
     kids = proc_children(pid) if pid else []
@@ -515,9 +707,17 @@ def main() -> int:
     payload = {
         "gates": g.rows,
         "failed": [r["gate"] for r in g.failed],
+        "pending_gates": g.pending,
         "verdict": "GO" if not g.failed else "NO_GO",
         "phase": args.phase,
+        # EXT-16: a GO in the pre phase is a *pre-freeze* GO. Deployment is only ever ready once the
+        # in-freeze quiescence gates have actually been evaluated, so this cannot be inferred from
+        # `verdict` alone by a caller that forgets which phase it asked for.
+        "deployment_ready": (not g.failed) and args.phase in {"revalidate"},
+        "quiescence_proven": in_freeze and not g.failed and not g.pending,
         "expect": {"head": want_head, "tree": want_tree, "candidate": args.candidate},
+        "freeze": {"principal": args.principal, "since": args.freeze_since,
+                   "marker_max_age_s": args.marker_max_age},
         "session_state": state,
         "db": stats,
         "service": props,

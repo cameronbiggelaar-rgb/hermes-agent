@@ -88,7 +88,7 @@ class TestPhaseAwarePostflight:
 
     def test_post_phase_accepts_the_freeze_it_engaged(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pf, "_drain_marker",
-                            lambda prefix="": {"present": True, "ok": True, "detail": "owned"})
+                            lambda prefix="", **_: {"present": True, "ok": True, "detail": "owned"})
         rows = dict((n, ok) for n, ok, _ in pf.runtime_gate_rows("post", self._state("draining"), 4242, "c" * 40))
         assert rows["runtime_state_frozen"] is True
         assert rows["admission_freeze_held"] is True
@@ -96,20 +96,21 @@ class TestPhaseAwarePostflight:
 
     def test_post_phase_rejects_running_gateway(self, monkeypatch):
         monkeypatch.setattr(pf, "_drain_marker",
-                            lambda prefix="": {"present": True, "ok": True, "detail": "owned"})
+                            lambda prefix="", **_: {"present": True, "ok": True, "detail": "owned"})
         rows = dict((n, ok) for n, ok, _ in pf.runtime_gate_rows("post", self._state("running"), 4242, "c" * 40))
         assert rows["runtime_state_frozen"] is False, "a post-release check must not pass while unfrozen"
 
     def test_post_phase_rejects_foreign_or_absent_freeze(self, monkeypatch):
         for marker in ({"present": False, "ok": False, "detail": "none"},
                        {"present": True, "ok": False, "detail": "principal=someone-else"}):
-            monkeypatch.setattr(pf, "_drain_marker", lambda prefix="", m=marker: m)
+            monkeypatch.setattr(pf, "_drain_marker", lambda prefix="", m=marker, **_: m)
             rows = dict((n, ok) for n, ok, _ in pf.runtime_gate_rows("post", self._state("draining"), 4242, "c" * 40))
             assert rows["admission_freeze_held"] is False
 
-    def test_pre_phase_still_requires_running_and_no_freeze(self, monkeypatch):
+    def test_pre_phase_still_requires_running_and_no_freeze(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pf, "_drain_marker",
-                            lambda prefix="": {"present": False, "ok": False, "detail": "none"})
+                            lambda prefix="", **_: {"present": False, "ok": False, "detail": "none"})
+        monkeypatch.setattr(pf, "ESTOP_MARKER", str(tmp_path / "ESTOP"))
         ok = dict((n, v) for n, v, _ in pf.runtime_gate_rows("pre", self._state("running"), 4242, "c" * 40))
         assert ok["runtime_state_running"] is True and ok["no_preexisting_freeze"] is True
         bad = dict((n, v) for n, v, _ in pf.runtime_gate_rows("pre", self._state("draining"), 4242, "c" * 40))
@@ -117,7 +118,7 @@ class TestPhaseAwarePostflight:
 
     def test_released_phase_requires_running_again(self, monkeypatch):
         monkeypatch.setattr(pf, "_drain_marker",
-                            lambda prefix="": {"present": False, "ok": False, "detail": "none"})
+                            lambda prefix="", **_: {"present": False, "ok": False, "detail": "none"})
         rows = dict((n, v) for n, v, _ in pf.runtime_gate_rows("released", self._state("running"), 4242, "c" * 40))
         assert rows["runtime_state_running"] is True
         rows = dict((n, v) for n, v, _ in pf.runtime_gate_rows("released", self._state("draining"), 4242, "c" * 40))

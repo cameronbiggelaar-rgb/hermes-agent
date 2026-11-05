@@ -203,7 +203,7 @@ class TestReleasedRuntimeContract:
     """EXT-10 runtime half: operational gateway state, cleared admission freeze, intact hold."""
 
     def _rows(self, state, marker, monkeypatch, pid=4242, sha="c" * 40):
-        monkeypatch.setattr(pf, "_drain_marker", lambda prefix="": marker)
+        monkeypatch.setattr(pf, "_drain_marker", lambda prefix="", **_: marker)
         return dict((n, ok) for n, ok, _ in pf.runtime_gate_rows("released",
                     {"gateway_state": state, "pid": pid, "code_sha": sha, "exit_reason": None},
                     pid, sha))

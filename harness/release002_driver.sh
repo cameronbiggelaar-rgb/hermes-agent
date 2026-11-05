@@ -252,13 +252,51 @@ plan_once() {  # sets P_RC P_GATES P_AGENTS P_LIVE
   P_AGENTS_RAW=$(printf '%s' "$out" | sed -n 's/.*"active_agents": *\([^,}]*\).*/\1/p' | head -1 | tr -d ' ')
   P_LIVE_RAW=$(printf '%s' "$out" | sed -n 's/.*"live_admissions": *\([^,}]*\).*/\1/p' | head -1 | tr -d ' ')
   P_VERDICT=$(printf '%s' "$out" | sed -n 's/.*"verdict": *"\([A-Z_]*\)".*/\1/p' | head -1)
+  # EXT-16: a phase-aware engine says which contract it evaluated. Absent (legacy engine) keeps the
+  # pre-EXT-16 behaviour so an older launcher is never reinterpreted as something it is not.
+  P_PHASE=$(printf '%s' "$out" | sed -n 's/.*"phase": *"\([a-z_]*\)".*/\1/p' | head -1)
+  P_PENDING=$(printf '%s' "$out" | sed -n 's/.*"pending_gates": *\[\([^]]*\)\].*/\1/p' | head -1)
+  P_DEPLOY_READY=$(printf '%s' "$out" | sed -n 's/.*"deployment_ready": *\([a-z]*\).*/\1/p' | head -1)
   PLAN_RC="$P_RC"; PLAN_LAST_GATES="${P_GATES:-}"; PLAN_AGENTS="$P_AGENTS"; PLAN_LIVE="$P_LIVE"
 }
 
-# A GO is accepted only when the admission evidence that justifies it is present and agrees. This
-# cannot turn a NO_GO into a GO; it can only refuse a GO.
+# A GO is accepted only when the evidence that justifies it is present and agrees. This cannot turn a
+# NO_GO into a GO; it can only refuse a GO.
+#
+# EXT-16: on a phase-aware engine, a *pre-freeze* GO must never be validated with the admission
+# counters — on a gateway carrying traffic those are non-zero by design, and requiring zero here is
+# the very defect EXT-16 corrects. The pre-freeze GO is validated instead on: the engine says it ran
+# the `pre` phase, it lists no failed gate, and the quiescence gates are *pending* rather than passed.
+# A pre-freeze GO that claims quiescence is refused as manufactured.
 validate_go() {  # -> 0 ok, 1 reason in VALIDATE_ERR
   VALIDATE_ERR=""
+  # A GO that still lists failed gates contradicts itself.
+  case "$(printf '%s' "${P_GATES:-}" | tr -d '" ' )" in
+    ''|none) ;;
+    *) VALIDATE_ERR="PLAN returned GO while listing failed gates (${P_GATES})"; return 1;;
+  esac
+  if [ -n "${P_PHASE:-}" ]; then
+    if [ "$P_PHASE" != "pre" ]; then
+      VALIDATE_ERR="PLAN GO came from phase '$P_PHASE'; the pre-freeze gate must be evaluated as 'pre'"
+      return 1
+    fi
+    if [ "${P_DEPLOY_READY:-false}" = "true" ]; then
+      VALIDATE_ERR="PLAN returned deployment_ready=true before the freeze"
+      return 1
+    fi
+    # Quiescence gates must be pending before the freeze. If any of them is reported as evaluated
+    # (i.e. absent from pending_gates) the engine is claiming quiescence it cannot have.
+    local qg="no_active_agents no_live_admissions quiet_window_elapsed cron_inflight_zero"
+    local q
+    for q in $qg; do
+      case "$(printf '%s' "${P_PENDING:-}" | tr -d '" ')" in
+        *"$q"*) ;;
+        *) VALIDATE_ERR="PLAN GO before the freeze without '$q' listed as pending — quiescence cannot be claimed pre-freeze"
+           return 1;;
+      esac
+    done
+    return 0
+  fi
   if [ -z "${P_AGENTS:-}" ]; then
     case "${P_AGENTS_RAW:-}" in
       ''|null) VALIDATE_ERR="PLAN returned GO without active_agents/live_admissions evidence";;
@@ -381,6 +419,9 @@ write_summary() {
  "started_at":"$STARTED_AT","finished_at":"$(TS)","duration_s":$dur,
  "open_at":"$(date -u -d "@$OPEN_EPOCH" +%FT%TZ)","deadline_at":"$(date -u -d "@$DEADLINE_EPOCH" +%FT%TZ)",
  "plan_entered":$([ "$PLAN_ENTERED" = 1 ] && echo true || echo false),"plan_state":"$PLAN_STATE",
+ "plan_phase":"${P_PHASE:-legacy}","plan_pending_gates":"$(printf '%s' "${P_PENDING:-}" | sed 's/"/\\"/g')",
+ "plan_deployment_ready":"${P_DEPLOY_READY:-unknown}",
+ "quiescence_asserted_by_plan":"$([ -n "${P_PHASE:-}" ] && echo false || echo unknown)",
  "plan_rc":"$PLAN_RC","plan_gates":"$(printf '%s' "${PLAN_LAST_GATES:-}" | sed 's/"/\\"/g')",
  "plan_failed_gates":[$(failed_gates_json)],"all_failed_gates_seen":"$(printf '%s' "$ALL_GATES" | sed 's/"/\\"/g')",
  "samples":$SAMPLES_N,"agents_min":"$AGENTS_MIN","agents_max":"$AGENTS_MAX",
@@ -411,6 +452,11 @@ write_receipt() {
       printf -- ' (last rc=%s)\n' "${PLAN_RC:-none}"
       printf -- '- failed gates (last sample): %s\n' "${PLAN_LAST_GATES:-none}"
       printf -- '- failed gates (union, all samples): %s\n' "${ALL_GATES:-none}"
+      if [ -n "${P_PHASE:-}" ]; then
+        printf -- '- PLAN phase: `%s` — pre-freeze only. Quiescence gates are **pending**, not passed: %s\n' \
+          "$P_PHASE" "${P_PENDING:-none}"
+        printf -- '- PLAN deployment_ready: `%s` (a pre-freeze GO never authorises deployment)\n' "${P_DEPLOY_READY:-unknown}"
+      fi
     fi
     printf -- '- plan samples: %s (active_agents %s..%s, live_admissions %s..%s); quiescence-only in %s/%s sample(s)%s\n' \
       "$SAMPLES_N" "${AGENTS_MIN:-unknown}" "${AGENTS_MAX:-unknown}" "${LIVE_MIN:-unknown}" "${LIVE_MAX:-unknown}" \
@@ -551,14 +597,32 @@ while :; do
   sleep "$POLL"
 done
 
-if [ "$MODE" = plan ]; then REASON="PLAN GO in plan mode; nothing applied"; DISPOSITION=GO_READY; exit 0; fi
+if [ "$MODE" = plan ]; then
+  # EXT-16: a pre-freeze GO qualifies the *sequence* to attempt a freeze; it is not deployment-ready
+  # and it does not assert quiescence, which can only be proven inside the freeze.
+  if [ -n "${P_PHASE:-}" ]; then
+    REASON="PLAN ${P_VERDICT:-GO} in plan mode (phase=${P_PHASE}); pre-freeze only — quiescence is not asserted and nothing was applied"
+  else
+    REASON="PLAN GO in plan mode; nothing applied"
+  fi
+  DISPOSITION=GO_READY; exit 0
+fi
 
-require_quiet_window "$GO_EPOCH" quiet
-case "$?" in
-  0) ;;
-  2) exit 2;;
-  *) exit 3;;
-esac
+# EXT-16: for a phase-aware engine the pre-freeze settle wait is removed — it was the ordering defect
+# (it required quiescence that only an engaged freeze can produce) and the runner now proves
+# quiescence inside the freeze with a stricter gate set. A legacy launcher keeps the old wait.
+if [ -n "${P_PHASE:-}" ]; then
+  phase settle "skipped: quiescence is proven inside the release freeze by the runner (EXT-16)"
+  journal_note="driver skipped pre-freeze settle for a phase-aware engine"
+  log "$journal_note"
+else
+  require_quiet_window "$GO_EPOCH" quiet
+  case "$?" in
+    0) ;;
+    2) exit 2;;
+    *) exit 3;;
+  esac
+fi
 
 phase apply "single application of $CANDIDATE"
 APPLY_STARTED=1
