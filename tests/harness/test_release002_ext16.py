@@ -281,8 +281,29 @@ def test_engine_refuses_a_quiesce_budget_wider_than_qualified():
 
 
 def test_engine_has_no_unphased_preflight_call():
-    body = ENGINE.read_text()
-    assert "--phase pre" in body and "--phase \"$1\"" in body
+    """Every preflight invocation in the engine must name its phase.
+
+    A substring check alone would pass on an engine that merely *contains* a phased call
+    somewhere, so each call site is inspected instead.
+    """
+    import re
+    calls, depth = [], None
+    lines = ENGINE.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if "release002_preflight.py" not in line or line.lstrip().startswith("#"):
+            continue
+        if "preflight()" in line:
+            continue
+        # a call site is the module path plus its continuation lines
+        chunk = line
+        j = i
+        while chunk.rstrip().endswith("\\") and j + 1 < len(lines):
+            j += 1
+            chunk += " " + lines[j]
+        calls.append(chunk)
+    assert calls, "no preflight call sites found in the engine"
+    missing = [c for c in calls if "--phase" not in c]
+    assert not missing, f"unphased preflight call(s): {missing}"
 
 
 # --------------------------------------------------------------- preflight: phase contract
