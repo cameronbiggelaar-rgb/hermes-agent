@@ -648,6 +648,18 @@ fi
 log "manifest verified against the pre-release identities"
 
 OTHER_ENGINES=$(pgrep -f 'release002_release\.sh --apply' | grep -v -e "^$$" -e "^$PPID$" || true)
+# pgrep forks a subshell that inherits this engine's argv, so it matches its own pattern; a naive
+# self-exclusion reports that transient child as a foreign engine and refuses every APPLY. Keep a
+# match only when the process is older than this engine, which no forked helper can be.
+if [ -n "$OTHER_ENGINES" ]; then
+  _SELF_START=$(sed -e 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+  OTHER_ENGINES=$(printf '%s\n' $OTHER_ENGINES | while read -r _p; do
+    case "$_p" in "$$"|"$PPID") continue ;; esac
+    _st=$(sed -e 's/.*) //' "/proc/$_p/stat" 2>/dev/null | awk '{print $20}')
+    [ -n "$_st" ] || continue
+    [ "$_st" -lt "$_SELF_START" ] && printf '%s\n' "$_p"
+  done || true)
+fi
 if [ -n "$OTHER_ENGINES" ]; then
   echo "refusing to mutate: another release engine is already running (pids: $OTHER_ENGINES)" >&2
   exit 65
