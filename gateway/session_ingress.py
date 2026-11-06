@@ -275,11 +275,21 @@ def row_turn_author(policy, row):
 
 
 async def execute_admission(authority, ref, row):
+    # Cutover admission freeze (release orchestration): an external drain engaged by a release
+    # pauses admission for *every* producer, not only messaging ingress and cron ticks. The gate is
+    # first so a frozen admission claims nothing at all — no busy tag, no viewer note, no turn — and
+    # the caller gets a settled failed turn naming the freeze instead of a silent queue position
+    # that no owner would claim. Re-read per admission: the marker is written before any deploy
+    # mutation, so a request arriving after the freeze cannot race it.
+    from gateway.drain_control import admission_frozen, freeze_turn_result
+    if admission_frozen(authority.runner):
+        return freeze_turn_result()
     busy_turn_started(row['admission_id'])
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
     if noted is not None:
         return noted
+
     from gateway.session_policy import policy_for_source
     policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
     if policy is not None and policy.source == 'cron':

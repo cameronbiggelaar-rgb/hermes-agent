@@ -230,7 +230,7 @@ class TestSystemdTimingAlignment:
     def test_aligned_unit_is_silent(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "probe")
         monkeypatch.setattr(sf, "_running_unit_name", lambda: "hermes-gateway.service")
-        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 210 * 1_000_000)
+        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda _unit: 300 * 1_000_000)
         got = sf.check_systemd_timing_alignment(180.0, 30.0)
         assert got is not None and got["mismatch"] is False
 
