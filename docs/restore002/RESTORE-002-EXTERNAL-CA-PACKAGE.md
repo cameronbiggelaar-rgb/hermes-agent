@@ -1,4 +1,11 @@
-# HERMES-RESTORE-002 — External CA review package (correction 8)
+# HERMES-RESTORE-002 — External CA review package (revision EXT-16A)
+
+> **Revision statement (EXT-16A).** The header previously read *"correction 8"* after eleven
+> corrections had been appended; that was a stale label, not a revision claim, and it is corrected
+> here. The document is append-only by construction: §1–§16 are the original package, §18–§24 are
+> EXT-06..EXT-15, and §25 is EXT-16 / EXT-16A. The identity table in §0 and the decision request in
+> §17 both still named candidates that later sections had already superseded; both are corrected in
+> place below. Revision identifier: **EXT-16A**. No executable code is changed by this revision.
 
 Consolidated evidence for the two remaining operational blockers after RESTORE-001 — the gateway
 shutdown/drain defect (**Fault B**) and the interrupted-session inventory — plus the two release
@@ -17,7 +24,11 @@ exactly as RESTORE-001 left it.
 | item | value |
 |---|---|
 | deployed installation (untouched) | HEAD `e05128febbc559469a5fb835a9235a543dfdfa64`, tree `dc05abd074c834569cf19ca89a6446d74be5c41d`, clean |
-| **release candidate** (code + tests + tooling, incl. EXT-13) | **`48a930361347ad2f947c0af9b861d92b03338599`**, tree **`36a27c4661ab83994ab6b7fd63a71788152d7fe1`** |
+| **release candidate** (code + tests + tooling, EXT-01..EXT-16A) | **`3c3e24a50bfcffbabe5a8356c662a7a69e870662`**, tree **`ebb20a087d82629c55d852dc3e96ec844902dacc`** (PR #9 head, draft, unmerged) |
+| previous candidate (EXT-16, superseded by EXT-16A — it journalled a successful deploy as `mutated=false`, defect D-10) | `7f63d7e98dec525c4404d7d62f1b8fb175e26207`, tree `e698ed3f1406b5b029434118c2edec6b15b324e8` |
+| qualified code state (EXT-16 sequencing; the candidate adds only a test-strength fix) | `e12515159c10f756b1e9fc3f71c215fc2a3bef81`, tree `7eeb5f661a72098b4c382839503df8ad733c5bdc` |
+| previous candidate (EXT-14, superseded by EXT-16 — authority exhausted, does not transfer) | `16a4d39a418f16ebac8eeb27ce7585158ce9e8ef`, tree `3ff43dc4aed41d3cc8bbe8df527aedbd6b77466f` |
+| previous candidate (EXT-13, superseded by EXT-14 — authority exhausted, does not transfer) | `48a930361347ad2f947c0af9b861d92b03338599`, tree `36a27c4661ab83994ab6b7fd63a71788152d7fe1` |
 | previous candidate (EXT-12, superseded by EXT-13 — authority exhausted, does not transfer) | `d4a5ef0a038ba1f4a9796291a445d09713ea5a28`, tree `7cc9304fb8d11ae6100d002b4b66ad556ab90a5a` |
 | previous candidate (EXT-06..11, superseded by EXT-12 — its release authority is exhausted and does not transfer) | `7596026ab684d4b52935388bfc17bcaa948f2387`, tree `7e6042d786509439badf8eba554bd9890f039ab0` |
 | previous candidate (EXT-06..10, superseded by EXT-11) | `a4f08d6315072e6057984ae74dbf289736f9d110`, tree `27f8916b1eafbad3328e09139c21c7654645fe99` |
@@ -27,7 +38,7 @@ exactly as RESTORE-001 left it.
 | earlier reviewed head (superseded) | `5d02e1da35ef8afcf5643f31d32283c7c1286740`, tree `b739c90e245e9fa74dfc154323e2353f03256de7` |
 | branch | `restore002/drain-envelope` in `/home/hermes/work/restore002-fix`, pushed to `fork` |
 | pull request | #9, draft, base `main` |
-| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `48a93036` / `36a27c46` |
+| this document | committed directly above the candidate; it changes no executable code, so the deployable identity stays `3c3e24a5` / `ebb20a08` — the identities §1–§16 were written against (`48a93036`) and EXT-16 published (`7f63d7e9`) are history, see the revision statement |
 | authoritative launcher | `/usr/local/lib/hermes-release/hermes-release-002` (+ `manifest.json`, `engine/<candidate>/`) — **not installed yet**; nothing is written outside the repo until the owner authorises step 1 of §15 |
 
 The candidate is a strict descendant of the reviewed head: `git diff 5d02e1da..48a93036` touches
@@ -1773,6 +1784,13 @@ tests/harness (full)                    247 passed in 73.20s
 ---
 
 ## 17. Release decision requested
+
+> **Superseded (EXT-16A).** Nothing in this section is a live request. The candidate it names
+> (`16a4d39a`) was superseded by EXT-16, whose candidate is `7f63d7e98dec525c4404d7d62f1b8fb175e26207`
+> / tree `e698ed3f1406b5b029434118c2edec6b15b324e8` (see §25). The owner's approval for the
+> 2026-11-04/05 attempts is exhausted and does not transfer to that candidate or to any later one.
+> What remains requested of the External CA is review, not authorisation to deploy: EXT-16A stops at
+> that boundary and requests no production release.
 
 1. **Approve section 15 steps 1–3** — `stage` (installs the launcher outside the installation and
    pins the candidate), `plan` (dry run), then one `apply` for candidate
