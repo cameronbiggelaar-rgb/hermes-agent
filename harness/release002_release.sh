@@ -63,6 +63,10 @@ MODE=plan
 CANDIDATE=""
 ARCHIVE=""
 MUTATED=0
+# MUTATED is the fail-closed intent guard (set immediately before the merge, so every failure from
+# that point is treated as post-mutation). JOURNAL_MUTATED is the journal's own record of a change
+# that was proven to have happened, and must never be set speculatively (D-10).
+JOURNAL_MUTATED=0
 PHASE=init
 RUN_ID=${HERMES_RELEASE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 # EXT-16: the freeze principal is this attempt's identity, and it is checked exactly — a marker or
@@ -109,8 +113,18 @@ journal() { # journal <phase> [note] [extra ct args...]
   mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
   # Every record pins the attempt's exact candidate, so a journal can never be replayed against a
   # different candidate and a stale attempt is detectable on its own (EXT-11).
+  #
+  # D-10: mutation is journal state, not shell state. Records write `--mutated` once the install is
+  # proven changed, and the flag is re-derived from the journal on every write so a single lost
+  # record cannot leave a post-mutation attempt looking untouched. It is deliberately NOT taken
+  # from $MUTATED: that variable is the fail-closed *intent* guard set just before the merge, and
+  # a refused merge must not be journalled as a mutation.
+  local mutated_flag=""
+  if [ "${JOURNAL_MUTATED:-0}" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null; then
+    mutated_flag="--mutated"
+  fi
   env -u PYTHONPATH "$PY3" "$ENGINE_DIR/release002_control.py" journal --path "$JOURNAL" \
-    --phase "$phase" --note "$note" --candidate "$CANDIDATE" --run-id "$RUN_ID" "$@" >/dev/null 2>&1 \
+    --phase "$phase" --note "$note" --candidate "$CANDIDATE" --run-id "$RUN_ID" $mutated_flag "$@" >/dev/null 2>&1 \
     || warn "journal write failed for phase $phase"
 }
 
@@ -246,6 +260,16 @@ receipt() { # $1=status  $2=detail-file
     echo "- install before: \`$EXPECT_HEAD\` (tree \`$EXPECT_TREE\`)"
     echo "- archive: \`$ARCHIVE\`"
     echo "- journal: \`$JOURNAL\`"
+    # D-10: the receipt must state the journal's own mutation verdict, so the final receipt, the
+    # phase records and the journal identity can be compared without re-deriving anything.
+    echo "- journal state: $(ct journal-state --path "$JOURNAL" 2>/dev/null | env -u PYTHONPATH "$PY3" -c 'import json,sys
+try:
+    s = json.load(sys.stdin)["state"]
+except Exception:
+    print("unreadable")
+else:
+    print("mutated=%s since=%s phase=%s result=%s run_id=%s" % (
+        str(s["mutated"]).lower(), s["since_phase"], s["phase"], s["result"], s["run_id"]))' 2>/dev/null || echo unreadable)"
     echo "- unit fragment sha256: $(sha256sum "$UNIT" 2>/dev/null | cut -d' ' -f1)"
     echo "- hold drop-in sha256: $(sha256sum "$HOLD_DROPIN" 2>/dev/null | cut -d' ' -f1)"
     echo "- timeout drop-in sha256: $(sha256sum "$TIMEOUT_DROPIN" 2>/dev/null | cut -d' ' -f1)"
@@ -422,7 +446,9 @@ abort_before_mutation() { # $1=phase $2=reason -> NO_GO with zero changes and ze
     warn "abort_before_mutation reached with MUTATED=1; deferring to rollback"
     rollback "$reason"
   fi
-  decision=$(ct failure --phase "$phase" --restart-attempts "$RESTART_ATTEMPTS" 2>/dev/null || echo '{}')
+  decision=$(ct failure --phase "$phase" --restart-attempts "$RESTART_ATTEMPTS" \
+    $( [ "$MUTATED" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null && echo --mutated ) \
+    2>/dev/null || echo '{}')
   action=$(printf '%s' "$decision" | env -u PYTHONPATH "$PY3" -c \
     'import json,sys;print(json.load(sys.stdin).get("action","needs_human"))' 2>/dev/null || echo needs_human)
   PHASE=aborted
@@ -803,7 +829,10 @@ fi
 if [ -n "$(git -C "$INSTALL" status --porcelain)" ]; then
   rollback "working tree dirty after merge"
 fi
-journal deploy "deployed $HEAD tree $TREE" --head "$HEAD"
+journal deploy "deployed $HEAD tree $TREE" --head "$HEAD" --mutated
+# The install is now provably at the candidate: from here on every record carries the mutation, and
+# recovery can date the change from this receipt instead of guessing from the phase name (D-10).
+JOURNAL_MUTATED=1
 log "deployed HEAD=$HEAD tree=$TREE"
 
 # --------------------------------------------------------------- phase 6: regenerate unit

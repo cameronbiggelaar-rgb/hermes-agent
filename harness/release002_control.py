@@ -1016,6 +1016,11 @@ def phase_record(journal: Optional[dict[str, Any]], *, phase: str, mutated: bool
     journal.setdefault("phases", [])
     record: dict[str, Any] = {"phase": phase, "at": datetime.now(timezone.utc).isoformat(),
                              "note": note}
+    if mutated:
+        # D-10: the record that first proves the change carries the flag itself, so mutation can be
+        # dated from the phase history ("interrupted immediately after the first mutation") instead
+        # of only from a journal-level boolean that a lost write could leave behind.
+        record["mutated"] = True
     for key, value in (extra or {}).items():
         if value is not None:
             record[key] = value
@@ -1029,6 +1034,39 @@ def phase_record(journal: Optional[dict[str, Any]], *, phase: str, mutated: bool
     if result is not None:
         journal["result"] = result
     return journal
+
+
+def mutation_state(journal: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Authoritative mutation history for one attempt (D-10).
+
+    ``mutated`` is sticky and is derived from the journal itself, in this order:
+
+    1. a phase record that carries ``mutated: true`` — the receipt that first proved the change
+       (the deploy record, or any later phase after a fixed engine wrote it);
+    2. the journal-level ``mutated`` flag;
+    3. a ``deploy`` phase record, which exists only after the merge was proven (HEAD, tree and a
+       clean worktree all verified), so a journal written by an engine that did not stamp the flag
+       still cannot look untouched.
+
+    The point of returning ``since_phase``/``since_at`` is that an attempt interrupted immediately
+    after its first mutation can be described exactly, instead of inferring mutation from "the
+    phase is late enough".
+    """
+    journal = journal or {}
+    phases = [r for r in (journal.get("phases") or []) if isinstance(r, dict)]
+    first = next((r for r in phases if r.get("mutated") is True), None)
+    if first is None:
+        first = next((r for r in phases if r.get("phase") == "deploy"), None)
+    return {
+        "mutated": bool(journal.get("mutated")) or first is not None,
+        "recorded": bool(journal.get("mutated")),
+        "since_phase": (first or {}).get("phase"),
+        "since_at": (first or {}).get("at"),
+        "phase": journal.get("phase"),
+        "result": journal.get("result"),
+        "run_id": journal.get("run_id"),
+        "candidate": journal.get("candidate"),
+    }
 
 
 def decide_failure(phase: str, *, mutated: bool, restart_attempts: int = 0) -> dict[str, Any]:
@@ -1087,7 +1125,9 @@ def decide_recovery(journal: Optional[dict[str, Any]], facts: dict[str, Any]) ->
         return {"action": "none", "reason": f"already settled as {journal.get('result')}"}
 
     phase = journal.get("phase")
-    mutated = bool(journal.get("mutated")) or phase in PHASES_AFTER_MUTATION
+    # D-10: mutation comes from the journal's own history (sticky flag, else a proven deploy
+    # receipt), with the phase heuristic kept as a third, fail-closed fallback.
+    mutated = mutation_state(journal)["mutated"] or phase in PHASES_AFTER_MUTATION
     head, cand, dep = facts.get("install_head"), facts.get("candidate"), facts.get("deployed")
     if phase not in PHASES:
         return {"action": "needs_human", "reason": f"journal is corrupt: unknown phase {phase!r}"}
@@ -1189,6 +1229,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     e.add_argument("--stop-timeout", type=int, default=300)
     e.add_argument("--start-timeout", type=int, default=90)
 
+    js = sub.add_parser("journal-state",
+                        help="authoritative mutation/receipt state of one attempt (D-10)")
+    js.add_argument("--path", default=JOURNAL_DEFAULT)
+
     r = sub.add_parser("recover-plan", help="decision for an interrupted supervisor")
     r.add_argument("--journal", default=JOURNAL_DEFAULT)
     r.add_argument("--repo", default="/home/hermes/.hermes/hermes-agent")
@@ -1271,6 +1315,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.stderr.write("\n")
             return 2
         return _emit(receipt, 0 if receipt.get("ok") else 2)
+
+    if args.cmd == "journal-state":
+        journal = read_journal(args.path)
+        state = mutation_state(journal)
+        # 0 = a journal was read, 3 = no journal at all (never "unmutated" as a guess).
+        return _emit({"state": state}, 0 if journal else 3)
 
     if args.cmd == "recover-plan":
         journal = read_journal(args.journal)
