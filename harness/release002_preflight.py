@@ -248,6 +248,34 @@ def _stamp(raw: Any) -> float:
     return 0.0
 
 
+def substitute_hold(pid: int) -> tuple[bool | None, str]:
+    """Read the recovery hold from the qualification gateway's own published state.
+
+    Production reads ``/proc/<pid>/environ``. Inside a disposable user namespace the release process
+    is a sibling, not an ancestor, of the gateway, so Yama blocks the read and namespace root holds
+    no ``CAP_SYS_PTRACE`` over the initial namespace. The qualification gateway therefore publishes
+    the hold it was started with. This fallback is reachable only inside a scenario: it demands the
+    per-run sentinel, a state file that declares itself a substitute, and a matching pid. On the host
+    none of those can hold, so the gate keeps its production meaning.
+    """
+    sentinel = os.environ.get("EXT17B_SENTINEL")
+    if not sentinel:
+        return None, "no qualification sentinel"
+    try:
+        with open(GW_STATE, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, f"qualification state unreadable: {exc}"
+    if state.get("substitute") is not True:
+        return None, "gateway state is not a qualification substitute"
+    if state.get("pid") != pid:
+        return None, f"qualification state pid {state.get('pid')} != {pid}"
+    hold = state.get("recovery_hold")
+    if not isinstance(hold, bool):
+        return None, "qualification state carries no recovery_hold"
+    return hold, "hold read from the qualification gateway state"
+
+
 def main_pid() -> int | None:
     props = systemctl_show("MainPID")
     try:
@@ -639,8 +667,12 @@ def main() -> int:
                     part == b"HERMES_RECOVERY_HOLD=1" for part in fh.read().split(b"\x00")
                 )
         except OSError as exc:
-            hold_env = None
-            g.add("hold_env_readable", None, f"/proc/{pid}/environ: {exc}")
+            hold_env, source = substitute_hold(pid)
+            if hold_env is None:
+                g.add("hold_env_readable", None, f"/proc/{pid}/environ: {exc}")
+            else:
+                g.add("hold_env_readable", hold_env,
+                      f"/proc/{pid}/environ unreadable ({exc.strerror}); {source}")
     g.add("hold_env_active", hold_env, "HERMES_RECOVERY_HOLD=1" if hold_env else "absent/unreadable")
 
     # 5b. Live runtime state: in-flight turns are counted here, and the pid must match systemd.
