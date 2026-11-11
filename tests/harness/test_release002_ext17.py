@@ -232,20 +232,26 @@ def test_supervisor_unit_can_be_bounded_by_systemd() -> None:
 
 
 def test_a_signal_settles_the_attempt_instead_of_abandoning_the_freeze() -> None:
-    """SIGTERM is how the envelope now arrives, so it has to reach the settlement path."""
+    """SIGTERM is how the envelope now arrives, so it has to reach the settlement path.
+
+    EXT-17A: the signal no longer renames the phase. ``PHASE=interrupted`` discarded the only
+    information the settlement needs -- what the attempt had actually done -- so a signal during
+    ``deploy`` looked identical to a signal during ``quiesce``. The signal is now recorded and the
+    real phase is settled through the failure contract.
+    """
     text = ENGINE.read_text()
-    on_signal = text[text.index("on_signal() {"):text.index("trap on_signal INT TERM")]
-    assert 'case "$PHASE" in' in on_signal and "rollback|done|recover|aborted) exit 70" in on_signal
-    assert "PHASE=interrupted" in on_signal
-    assert "trap on_signal INT TERM" in text
+    on_signal = text[text.index("on_signal() {"):text.index("trap 'on_signal TERM' INT TERM")]
+    assert "SIGNAL_SEEN=$sig" in on_signal
+    assert "PHASE=interrupted" not in on_signal, "the settlement needs the phase the attempt died in"
+    assert "ignoring $sig while settling" in on_signal, "a signal during settlement must not re-enter"
+    assert "trap 'on_signal TERM' INT TERM" in text
 
     on_exit = text[text.index("on_exit() {"):text.index("trap on_exit EXIT")]
     assert "rollback|done|recover|aborted) return 0" in on_exit
-    assert "interrupted) return 0" not in on_exit, (
+    assert "journal_settle aborted" in on_exit, (
         "an interrupted attempt must settle: rollback if mutated, else release this run's freeze "
         "and journal ABORTED_SAFE")
     assert 'freeze_release "aborted in phase' in on_exit
-    assert "--result ABORTED_SAFE" in on_exit
 
 
 def test_the_supervisor_envelope_still_covers_the_phase_budgets() -> None:

@@ -78,13 +78,23 @@ ARCHIVE_MAX_SECONDS = 120          # pre-cutover archive of receipts and unit co
 RESTART_MARGIN_SECONDS = 30        # systemctl start/stop overhead around the stop budget
 ENVELOPE_SAFETY_SECONDS = 120      # slack for slow disk/telemetry before RuntimeMaxSec kills us
 
-PHASES = ("start", "stage", "preflight", "archive", "freeze", "quiesce", "revalidate",
-          "aborted", "recover", "rollback",
-          "deploy", "unit", "restart", "verify", "unfreeze", "report")
-PHASES_AFTER_MUTATION = frozenset({"deploy", "unit", "restart", "verify"})
+# Every phase name the engine can actually be sitting in when it dies (EXT-17A). The list has to be
+# complete: an unlisted phase used to fall through to "unknown phase: refusing to guess", which is
+# fail-closed but unhelpful, and -- worse -- hid the difference between a phase that can never have
+# touched the installation and one that always has.
+PHASES = ("start", "stage", "init", "guard", "dry-run", "verify-only",
+          "identity", "manifest-pre", "preflight", "archive", "freeze", "quiesce", "revalidate",
+          "aborted", "recover", "rollback", "deploy-intent",
+          "deploy", "unit", "restart", "verify", "verify-shutdown", "verify-post",
+          "unfreeze", "report", "done")
+PHASES_AFTER_MUTATION = frozenset({"deploy", "unit", "restart", "verify", "verify-shutdown",
+                                   "verify-post", "unfreeze", "done"})
 # Everything up to and including revalidation happens with the running installation untouched.
-PRE_MUTATION_PHASES = frozenset({"start", "stage", "preflight", "archive", "freeze", "quiesce",
-                                 "revalidate", "aborted"})
+# ``deploy-intent`` is the record written immediately before the fast-forward: it proves an attempt
+# was made, not that anything changed, so a failure there is still a pre-mutation abort.
+PRE_MUTATION_PHASES = frozenset({"start", "stage", "init", "guard", "dry-run", "verify-only",
+                                 "identity", "manifest-pre", "preflight", "archive", "freeze",
+                                 "quiesce", "revalidate", "aborted", "deploy-intent"})
 MAX_RESTART_ATTEMPTS = 1
 SETTLED_RESULTS = frozenset({"COMPLETE", "ROLLED_BACK", "ABORTED_SAFE"})
 
@@ -1036,6 +1046,22 @@ def phase_record(journal: Optional[dict[str, Any]], *, phase: str, mutated: bool
     return journal
 
 
+def journalled_deployed(journal: Optional[dict[str, Any]]) -> Optional[str]:
+    """The identity the attempt said it was deploying *from*, or ``None``.
+
+    Only the ``deploy-intent`` record counts: it is written before the fast-forward with the head the
+    install was expected to hold. The ``deploy`` receipt's head is the *new* identity, so using it as a
+    rollback target would undo the release into itself.
+    """
+    for record in reversed(list((journal or {}).get("phases") or [])):
+        if isinstance(record, dict) and record.get("phase") == "deploy-intent":
+            head = str(record.get("head") or "").strip().lower()
+            if len(head) == 40:
+                return head
+            return None
+    return None
+
+
 def mutation_state(journal: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Authoritative mutation history for one attempt (D-10).
 
@@ -1057,7 +1083,13 @@ def mutation_state(journal: Optional[dict[str, Any]]) -> dict[str, Any]:
     first = next((r for r in phases if r.get("mutated") is True), None)
     if first is None:
         first = next((r for r in phases if r.get("phase") == "deploy"), None)
+    # EXT-17A: "an attempt was made" and "something changed" are different facts, and only the second
+    # one licenses a plain unfreeze. intent_at/intent_phase record the first.
+    intent = next((r for r in reversed(phases) if r.get("phase") == "deploy-intent"), None)
     return {
+        "intent": intent is not None,
+        "intent_phase": (intent or {}).get("phase"),
+        "intent_at": (intent or {}).get("at"),
         "mutated": bool(journal.get("mutated")) or first is not None,
         "recorded": bool(journal.get("mutated")),
         "since_phase": (first or {}).get("phase"),
@@ -1132,6 +1164,24 @@ def decide_recovery(journal: Optional[dict[str, Any]], facts: dict[str, Any]) ->
     if phase not in PHASES:
         return {"action": "needs_human", "reason": f"journal is corrupt: unknown phase {phase!r}"}
     if not mutated:
+        state = mutation_state(journal)
+        if state["intent"]:
+            # EXT-17A: a deploy-intent record with no proven mutation means the attempt may have died
+            # inside the fast-forward itself. "Nothing recorded as mutated" is not "nothing changed":
+            # release only when the installation is provably at the deployed identity and clean.
+            if head is None or not dep:
+                return {"action": "needs_human",
+                        "reason": "deploy-intent recorded but the install identity is unreadable"}
+            if head == dep and facts.get("install_clean") is True:
+                return {"action": "unfreeze",
+                        "reason": "deploy intent recorded, but the install is provably untouched "
+                                  "(deployed identity, clean worktree)"}
+            if head == cand and cand:
+                return {"action": "rollback",
+                        "reason": "deploy intent recorded and the candidate is checked out: undoing"}
+            return {"action": "needs_human",
+                    "reason": f"deploy intent recorded and the install HEAD {head} is not the "
+                              "deployed identity: mutation state unknown"}
         return {"action": "unfreeze", "reason": f"interrupted at {phase} before any mutation"}
     if head is None or not cand or not dep:
         return {"action": "needs_human", "reason": "cannot read install identity during recovery"}
@@ -1146,6 +1196,11 @@ def decide_recovery(journal: Optional[dict[str, Any]], facts: dict[str, Any]) ->
             return {"action": "rollback", "reason": "candidate is checked out but the service is not active"}
         return {"action": "needs_human", "reason": "candidate deployed; service state unknown"}
     if head == dep:
+        if facts.get("install_clean") is False:
+            # Matching HEAD with modified bytes is *not* "nothing applied": something wrote to the
+            # worktree, and only a human can say what. Keep the freeze.
+            return {"action": "needs_human",
+                    "reason": "install HEAD equals the deployed identity but the worktree is dirty"}
         return {"action": "unfreeze", "reason": "install is still at the deployed identity; nothing applied"}
     return {"action": "needs_human", "reason": f"install HEAD {head} matches neither candidate nor deployed"}
 
@@ -1324,8 +1379,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "recover-plan":
         journal = read_journal(args.journal)
-        facts = {"install_head": git_identity(args.repo).get("head"), "candidate": args.candidate or None,
-                 "deployed": args.deployed or None, "service_active": service_active(),
+        ident = git_identity(args.repo)
+        # EXT-17A: a deploy-intent record can only justify an unfreeze when the worktree is provably
+        # clean, so cleanliness is a fact of the decision, not of the caller's optimism.
+        # The deployed identity is what the attempt itself named before it touched anything: the
+        # ``deploy-intent`` record's head. Recovering it from the journal (instead of only from a CLI
+        # flag) means a restart of the recovery process cannot lose the rollback target, and a journal
+        # with no such record stays unknown rather than guessed.
+        deployed = args.deployed or journalled_deployed(journal)
+        facts = {"install_head": ident.get("head"), "candidate": args.candidate or None,
+                 "deployed": deployed, "service_active": service_active(),
+                 "install_clean": ident.get("dirty_files") == [],
                  "freeze_present": drain_marker_path().exists(), "estop_present": estop_marker_path().exists()}
         decision = decide_recovery(journal, facts)
         decision["facts"] = facts

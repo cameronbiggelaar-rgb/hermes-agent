@@ -1117,7 +1117,15 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
     """
     if os.name != "posix":
         return []
-    import psutil
+    try:
+        import psutil
+    except ModuleNotFoundError:
+        # pyproject declares psutil only for ``python_version >= '3.14'``, while this suite supports
+        # 3.11-3.13. On those interpreters the reaper has no scanner, and a bare import here turned
+        # an all-pass run into exit code 1 *after* the summary line. Skipping the scan is a reported
+        # no-op, not a silent teardown crash: the process exit code has to mean something.
+        sys.stderr.write("[conftest] psutil unavailable: session process reaping skipped\n")
+        return []
 
     resolved = [Path(r).resolve() for r in roots if r]
     me = os.getpid()

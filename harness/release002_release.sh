@@ -44,6 +44,14 @@ STATE_JSON=$HHOME/gateway_state.json
 ESTOP_FILE=$HHOME/ESTOP
 DRAIN_MARKER=$HHOME/.drain_request.json
 LOCK=/var/lib/hermes-release/restore-002.lock
+# EXT-17A: the isolated qualification harness runs the real engine more than once and must not
+# contend on (or even open) the production lock. Same guarded shape as the unit hook: the override
+# exists only with HERMES_RELEASE_QUALIFY=1, so no environment can quietly move a real release's lock.
+if [ -n "${HERMES_RELEASE_LOCK:-}" ]; then
+  [ "${HERMES_RELEASE_QUALIFY:-}" = "1" ] \
+    || { echo "refusing HERMES_RELEASE_LOCK without HERMES_RELEASE_QUALIFY=1" >&2; exit 64; }
+  LOCK=$HERMES_RELEASE_LOCK
+fi
 JOURNAL=${HERMES_RELEASE_JOURNAL:-/var/lib/hermes-release/restore-002/journal.json}
 ENGINE_DIR=$(cd "$(dirname "$0")" && pwd)
 # The manifest's engine keys are "harness/<file>" relative to the staged engine root; $ENGINE_DIR is
@@ -395,151 +403,438 @@ PYEOF
   journal freeze "drain marker + estop engaged; gateway_state=draining"
 }
 
-freeze_release() {
-  local why=${1:-release complete}
+# ================= EXT-17A: interruption settlement library (BEGIN) =================
+# Everything between these two markers is the settlement surface: freeze release, the pre-mutation
+# abort, the bounded rollback, durable NEEDS_HUMAN evidence, verified terminal journal settlement
+# and the EXIT/INT/TERM traps. It is deliberately self-contained and side-effect free apart from the
+# trap registrations at the end, because tests/harness/test_release002_ext17a_settlement.py extracts
+# exactly this region and drives it with fault-injecting stubs. That harness therefore executes
+# *these* functions, not a copy of them: move or restructure the region and the extraction fails
+# loudly instead of silently testing nothing.
+#
+# Settlement rules (each is covered by a fault-injection test):
+#   * no settlement step is allowed to abort the remaining steps -- every step runs through
+#     ``settle_run``, which records the failure and returns 0;
+#   * nothing is reported as released, restored or settled until it has been verified;
+#   * every unverifiable outcome becomes durable NEEDS_HUMAN evidence beside the journal, keyed to
+#     this attempt's run id;
+#   * a signal during settlement is ignored -- settlement, not the signal, decides the outcome.
+
+SETTLE_FAILURES=""
+SETTLING=0
+SIGNAL_SEEN=""
+
+settle_fail() { SETTLE_FAILURES="${SETTLE_FAILURES}${SETTLE_FAILURES:+; }$1"; warn "settlement step failed: $1"; }
+
+settle_run() { # settle_run <description> <command...> -- records a failure, never aborts the settlement
+  local what=$1
+  shift
+  if "$@" >>"${ARCHIVE:-/dev/null}/settlement.log" 2>&1; then
+    return 0
+  fi
+  settle_fail "$what"
+  return 0
+}
+
+needs_human() { # needs_human <reason> -- durable, attempt-scoped evidence; never fails the shell
+  local reason=$1 dir file head tree active held
+  dir=$(dirname "$JOURNAL")
+  head=$(git -C "$INSTALL" rev-parse HEAD 2>/dev/null || echo unknown)
+  tree=$(git -C "$INSTALL" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
+  active=$(systemctl show "$SERVICE" -p ActiveState --value 2>/dev/null || echo unknown)
+  held=false
+  if [ "$FROZEN" -eq 1 ] || [ "$ESTOP_OURS" -eq 1 ]; then held=true; fi
+  mkdir -p "$dir" 2>/dev/null || true
+  file=$dir/NEEDS_HUMAN-$RUN_ID.json
+  {
+    printf '{\n'
+    printf '  "release": "RESTORE-002",\n'
+    printf '  "disposition": "RESTORE-002_NEEDS_HUMAN",\n'
+    printf '  "run_id": "%s",\n' "$RUN_ID"
+    printf '  "principal": "%s",\n' "$PRINCIPAL"
+    printf '  "candidate": "%s",\n' "$CANDIDATE"
+    printf '  "phase": "%s",\n' "$PHASE"
+    printf '  "reason": "%s",\n' "${reason//\"/\'}"
+    printf '  "mutated_intent": %s,\n' "$([ "$MUTATED" -ne 0 ] && echo true || echo false)"
+    printf '  "journal_mutated": %s,\n' "$([ "${JOURNAL_MUTATED:-0}" -ne 0 ] && echo true || echo false)"
+    printf '  "freeze_held_by_this_run": %s,\n' "$held"
+    printf '  "drain_marker_present": %s,\n' "$([ -e "$DRAIN_MARKER" ] && echo true || echo false)"
+    printf '  "estop_present": %s,\n' "$([ -e "$ESTOP_FILE" ] && echo true || echo false)"
+    printf '  "install_head": "%s",\n' "$head"
+    printf '  "install_tree": "%s",\n' "$tree"
+    printf '  "service_active_state": "%s",\n' "$active"
+    printf '  "restart_attempts": %s,\n' "$RESTART_ATTEMPTS"
+    printf '  "settlement_failures": "%s",\n' "${SETTLE_FAILURES//\"/\'}"
+    printf '  "signal_seen": "%s",\n' "$SIGNAL_SEEN"
+    printf '  "at": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '}\n'
+  } >"$file.tmp" 2>/dev/null && mv -f "$file.tmp" "$file" 2>/dev/null \
+    || warn "could not write NEEDS_HUMAN evidence at $file"
+  if [ -n "${ARCHIVE:-}" ]; then
+    mkdir -p "$ARCHIVE" 2>/dev/null || true
+    cp "$file" "$ARCHIVE/NEEDS_HUMAN.json" 2>/dev/null || true
+    printf '%s\n' "$reason" >"$ARCHIVE/NEEDS_HUMAN.txt" 2>/dev/null || true
+  fi
+  warn "NEEDS_HUMAN: $reason (evidence: $file)"
+}
+
+journal_settle() { # journal_settle <phase> <note> <result> -- terminal record, verified by read-back
+  local phase=$1 note=$2 result=$3 out rc got mutated_flag=""
+  if [ "${JOURNAL_MUTATED:-0}" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null; then
+    mutated_flag="--mutated"
+  fi
+  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  set +e
+  out=$(ct journal --path "$JOURNAL" --phase "$phase" --note "$note" --candidate "$CANDIDATE" \
+        --run-id "$RUN_ID" --result "$result" $mutated_flag 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    warn "terminal journal write failed (rc=$rc) for $phase/$result: ${out:-no output}"
+    needs_human "journal settlement failed at $phase ($result)"
+    exit 78
+  fi
+  got=$(ct journal-state --path "$JOURNAL" 2>/dev/null | env -u PYTHONPATH "$PY3" -c \
+    'import json,sys
+try:
+    print(json.load(sys.stdin)["state"]["result"] or "")
+except Exception:
+    print("")' 2>/dev/null || echo "")
+  if [ "$got" != "$result" ]; then
+    warn "terminal journal record did not survive read-back (wanted $result, read '${got:-unreadable}')"
+    needs_human "journal settlement unverified at $phase ($result)"
+    exit 78
+  fi
+  PHASE=$phase
+  return 0
+}
+
+journal_require_attempt() { # refuse to change admission state without a durable record of this attempt
+  local state rid cand rc
+  set +e
+  state=$(ct journal-state --path "$JOURNAL" 2>/dev/null)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] || [ -z "$state" ]; then
+    warn "refusing: no readable journal at $JOURNAL; this attempt could not record itself"
+    exit 65
+  fi
+  rid=$(printf '%s' "$state" | env -u PYTHONPATH "$PY3" -c \
+    'import json,sys;print(json.load(sys.stdin)["state"]["run_id"] or "")' 2>/dev/null || echo "")
+  cand=$(printf '%s' "$state" | env -u PYTHONPATH "$PY3" -c \
+    'import json,sys;print(json.load(sys.stdin)["state"]["candidate"] or "")' 2>/dev/null || echo "")
+  if [ "$rid" != "$RUN_ID" ] || [ "$cand" != "$CANDIDATE" ]; then
+    warn "refusing: journal records run_id='${rid:-none}' candidate='${cand:-none}', this attempt is '$RUN_ID'/'$CANDIDATE'"
+    exit 65
+  fi
+  return 0
+}
+
+freeze_release() { # freeze_release <why> -- 0 only when admission is provably restored by this attempt
+  local why=${1:-release complete} deadline state="" cleared=1
   PHASE=unfreeze
-  rm -f "$ARCHIVE/.freeze-alive"
+  rm -f "${ARCHIVE:-/dev/null}/.freeze-alive" 2>/dev/null || true
   if [ -n "$KEEPALIVE_PID" ]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; KEEPALIVE_PID=""; fi
   if [ "$FROZEN" -eq 1 ]; then
     # EXT-16: exact ownership before the marker is changed. A marker that is present but not ours is
-    # left alone and reported, never cleared — releasing another attempt's freeze is worse than
-    # leaving a freeze in place for a human.
+    # left alone and reported, never cleared -- releasing another attempt's freeze is worse than
+    # leaving a freeze in place for a human. EXT-17A: the ownership flag is NOT cleared on that path,
+    # so the caller still knows which mechanism this attempt is holding.
     if [ -e "$DRAIN_MARKER" ] && ! drain_is_ours; then
-      warn "NEEDS_HUMAN: the drain marker is no longer owned by $PRINCIPAL; leaving it in place"
-      FROZEN=0
-      journal aborted "freeze ownership lost before release; marker left in place" 2>/dev/null || true
+      needs_human "the drain marker is no longer owned by $PRINCIPAL; leaving it in place"
       return 1
     fi
-    ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
+    if [ -e "$DRAIN_MARKER" ]; then
+      ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
 from gateway.drain_control import clear_drain_request
-print("cleared" if clear_drain_request() else "absent")
+clear_drain_request()
 PYEOF
-    ) || warn "could not clear the drain marker"
-    FROZEN=0
+      ) >>"${ARCHIVE:-/dev/null}/settlement.log" 2>&1 || settle_fail "could not clear the drain marker"
+      # The return value of the helper is not the proof; the marker's absence is.
+      if [ -e "$DRAIN_MARKER" ]; then
+        cleared=0
+        settle_fail "the drain marker is still present after clear_drain_request()"
+      fi
+    fi
   fi
   if [ "$ESTOP_OURS" -eq 1 ]; then
     if [ -e "$ESTOP_FILE" ] && ! estop_is_ours; then
-      warn "NEEDS_HUMAN: the ESTOP sentinel is no longer owned by $PRINCIPAL; leaving it in place"
-      ESTOP_OURS=0
-      journal aborted "ESTOP ownership lost before release; sentinel left in place" 2>/dev/null || true
+      needs_human "the ESTOP sentinel is no longer owned by $PRINCIPAL; leaving it in place"
       return 1
     fi
-    ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
+    if [ -e "$ESTOP_FILE" ]; then
+      ( cd "$INSTALL" && env -u PYTHONPATH HERMES_HOME="$HHOME" "$PY" - <<'PYEOF'
 from agent.estop import disengage
-print("cleared" if disengage() else "absent")
+disengage()
 PYEOF
-    ) || warn "could not clear the ESTOP sentinel this run wrote"
-    ESTOP_OURS=0
+      ) >>"${ARCHIVE:-/dev/null}/settlement.log" 2>&1 || settle_fail "could not clear the ESTOP sentinel this run wrote"
+      if [ -e "$ESTOP_FILE" ]; then
+        cleared=0
+        settle_fail "the ESTOP sentinel is still present after disengage()"
+      fi
+    fi
   fi
-  local deadline=$((SECONDS + UNFREEZE_WAIT)) state=""
+  deadline=$((SECONDS + UNFREEZE_WAIT))
   while [ $SECONDS -lt $deadline ]; do
     state=$(gateway_field gateway_state)
     [ "$state" != "draining" ] && break
     sleep 2
   done
-  log "admission restored ($why): gateway_state=${state:-unreadable} estop=$([ -e "$ESTOP_FILE" ] && echo present || echo absent)"
-  journal unfreeze "admission restored: $why" 2>/dev/null || true
+  # EXT-17A: "admission restored" is a claim, so it is only made when all three proofs hold: this
+  # run's markers are gone, no marker at all remains, and the live gateway is no longer draining.
+  if [ "$cleared" -eq 1 ] && [ ! -e "$DRAIN_MARKER" ] && [ ! -e "$ESTOP_FILE" ] && [ "$state" != "draining" ]; then
+    FROZEN=0
+    ESTOP_OURS=0
+    log "admission restored ($why): gateway_state=${state:-unreadable} estop=absent"
+    journal unfreeze "admission restored: $why" 2>/dev/null || true
+    return 0
+  fi
+  log "admission NOT restored ($why): gateway_state=${state:-unreadable} drain_marker=$([ -e "$DRAIN_MARKER" ] && echo present || echo absent) estop=$([ -e "$ESTOP_FILE" ] && echo present || echo absent)"
+  needs_human "admission could not be restored ($why): ${SETTLE_FAILURES:-state unverifiable}; freeze left engaged"
+  journal aborted "freeze release unverified: $why" 2>/dev/null || true
+  return 1
 }
 
 abort_before_mutation() { # $1=phase $2=reason -> NO_GO with zero changes and zero restarts (EXT-08)
-  local phase=$1 reason=$2 decision action
+  local phase=$1 reason=$2 decision action mutated_flag=""
+  SETTLING=1
   if [ "$MUTATED" -ne 0 ]; then
     # Defensive: a pre-mutation abort is only valid before the first mutation. If that invariant is
     # ever broken, undoing the mutation is the correct response, not pretending nothing happened.
     warn "abort_before_mutation reached with MUTATED=1; deferring to rollback"
     rollback "$reason"
   fi
-  decision=$(ct failure --phase "$phase" --restart-attempts "$RESTART_ATTEMPTS" \
-    $( [ "$MUTATED" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null && echo --mutated ) \
-    2>/dev/null || echo '{}')
+  if [ "${JOURNAL_MUTATED:-0}" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null; then
+    mutated_flag="--mutated"
+  fi
+  decision=$(ct failure --phase "$phase" --restart-attempts "$RESTART_ATTEMPTS" $mutated_flag 2>/dev/null || echo '{}')
   action=$(printf '%s' "$decision" | env -u PYTHONPATH "$PY3" -c \
     'import json,sys;print(json.load(sys.stdin).get("action","needs_human"))' 2>/dev/null || echo needs_human)
   PHASE=aborted
   if [ -n "$ARCHIVE" ]; then
-    mkdir -p "$ARCHIVE"; printf '%s\n' "$decision" >"$ARCHIVE/no-go-decision.json" 2>/dev/null || true
+    mkdir -p "$ARCHIVE" 2>/dev/null || true
+    printf '%s\n' "$decision" >"$ARCHIVE/no-go-decision.json" 2>/dev/null || true
   fi
   log "NO_GO before any mutation at phase '$phase': $reason (restart=no, rollback=no)"
   if [ "$action" != "release_freeze" ]; then
     warn "failure contract for '$phase' says '$action', not release_freeze: leaving state for a human"
+    needs_human "NO_GO at $phase needs a human: $reason"
     journal aborted "NO_GO at $phase needs a human: $reason" 2>/dev/null || true
     exit 2
   fi
   # Release only the freeze this run created: freeze_release clears the drain marker only when
-  # FROZEN=1 (ours) and the ESTOP sentinel only when ESTOP_OURS=1 (ours).
+  # FROZEN=1 (ours) and the ESTOP sentinel only when ESTOP_OURS=1 (ours), and only reports success
+  # once both are verifiably gone.
   if [ "$FROZEN" -eq 1 ] || [ "$ESTOP_OURS" -eq 1 ]; then
-    freeze_release "NO_GO before mutation at $phase: $reason"
+    if ! freeze_release "NO_GO before mutation at $phase: $reason"; then
+      needs_human "NO_GO at $phase could not release this attempt's freeze: $reason"
+      journal aborted "NO_GO at $phase: freeze release failed: $reason" 2>/dev/null || true
+      exit 3
+    fi
   fi
-  journal aborted "NO_GO before mutation at $phase: $reason" --result ABORTED_SAFE 2>/dev/null || true
+  journal_settle aborted "NO_GO before mutation at $phase: $reason" ABORTED_SAFE
   if [ -n "$ARCHIVE" ]; then
     receipt "NO_GO_BEFORE_MUTATION" "$ARCHIVE/no-go-decision.json" 2>/dev/null || true
   fi
   exit 2
 }
 
-rollback() { # $1=reason
-  local reason=$1
+rollback() { # rollback <reason> -- bounded rollback whose result is verified before it is reported
+  local reason=$1 head tree active unit_sha want_sha deadline state="" rc
   PHASE=rollback
+  SETTLING=1
   warn "rolling back: $reason"
   journal rollback "rollback started: $reason"
   if [ -f "$ARCHIVE/unit/hermes-gateway.service" ]; then
-    install -m 0644 -o root -g root "$ARCHIVE/unit/hermes-gateway.service" "$UNIT"
+    settle_run "restore the archived unit" install -m 0644 -o root -g root \
+      "$ARCHIVE/unit/hermes-gateway.service" "$UNIT"
   fi
   if [ -f "$ARCHIVE/unit/90-recovery-hold.conf" ]; then
-    install -m 0644 -o root -g root "$ARCHIVE/unit/90-recovery-hold.conf" "$HOLD_DROPIN"
+    settle_run "restore the recovery-hold drop-in" install -m 0644 -o root -g root \
+      "$ARCHIVE/unit/90-recovery-hold.conf" "$HOLD_DROPIN"
   fi
   if [ -f "$ARCHIVE/unit/95-timeout-stop.conf" ]; then
-    install -m 0644 -o root -g root "$ARCHIVE/unit/95-timeout-stop.conf" "$TIMEOUT_DROPIN"
+    settle_run "restore the timeout-stop drop-in" install -m 0644 -o root -g root \
+      "$ARCHIVE/unit/95-timeout-stop.conf" "$TIMEOUT_DROPIN"
   fi
-  systemctl daemon-reload
-  git -C "$INSTALL" reset --hard "$EXPECT_HEAD" >/dev/null 2>&1 || warn "git reset --hard failed"
-  RESTART_ATTEMPTS=$((RESTART_ATTEMPTS + 1))
-  timeout 340 systemctl restart "$SERVICE" || warn "rollback restart returned non-zero"
-  sleep 20
-  git -C "$INSTALL" rev-parse HEAD >"$ARCHIVE/rollback.txt" 2>&1 || true
-  systemctl show "$SERVICE" -p ActiveState -p MainPID -p NRestarts >>"$ARCHIVE/rollback.txt" 2>&1 || true
-  freeze_release "rollback: $reason"
-  journal report "rollback complete" --result ROLLED_BACK
+  settle_run "daemon-reload after restoring the unit" systemctl daemon-reload
+  if git -C "$INSTALL" reset --hard "$EXPECT_HEAD" >>"${ARCHIVE:-/dev/null}/settlement.log" 2>&1; then
+    :
+  else
+    settle_fail "git reset --hard $EXPECT_HEAD failed"
+  fi
+  # EXT-17A: at most one rollback restart (the second restart overall). A third restart, or a
+  # rollback re-entered after both budgets are spent, is a human decision, never automatic.
+  if [ "$RESTART_ATTEMPTS" -ge 2 ]; then
+    needs_human "rollback needed after $RESTART_ATTEMPTS restart attempt(s): refusing a further restart ($reason)"
+  else
+    RESTART_ATTEMPTS=$((RESTART_ATTEMPTS + 1))
+    set +e
+    timeout 340 systemctl restart "$SERVICE" >>"${ARCHIVE:-/dev/null}/settlement.log" 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || settle_fail "rollback restart returned $rc"
+  fi
+  deadline=$((SECONDS + STARTUP_WAIT))
+  while [ $SECONDS -lt $deadline ]; do
+    state=$(systemctl show "$SERVICE" -p ActiveState --value 2>/dev/null || echo unknown)
+    [ "$state" = "active" ] && break
+    sleep 3
+  done
+  head=$(git -C "$INSTALL" rev-parse HEAD 2>/dev/null || echo unknown)
+  tree=$(git -C "$INSTALL" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
+  active=$(systemctl show "$SERVICE" -p ActiveState --value 2>/dev/null || echo unknown)
+  unit_sha=$(sha256sum "$UNIT" 2>/dev/null | cut -d' ' -f1 || echo unknown)
+  want_sha=$(cut -d' ' -f1 "$ARCHIVE/unit/SHA256SUMS" 2>/dev/null | head -1 || echo unknown)
+  {
+    echo "reason: $reason"
+    echo "head: $head (expected $EXPECT_HEAD)"
+    echo "tree: $tree (expected $EXPECT_TREE)"
+    echo "unit_sha256: $unit_sha (archived ${want_sha:-unknown})"
+    echo "active_state: $active"
+    echo "restart_attempts: $RESTART_ATTEMPTS"
+    echo "settlement_failures: ${SETTLE_FAILURES:-none}"
+  } >"$ARCHIVE/rollback.txt" 2>/dev/null || true
+  # Verification first, settlement second: a rollback is only reported when the installation is
+  # provably back at the deployed identity, the archived unit is back in place and the service is
+  # active. Anything else is an unproven outcome and keeps the freeze for a human.
+  if [ "$head" != "$EXPECT_HEAD" ] || [ "$tree" != "$EXPECT_TREE" ] \
+     || [ "$active" != "active" ] \
+     || { [ -n "$want_sha" ] && [ "$unit_sha" != "$want_sha" ]; } \
+     || [ -n "$SETTLE_FAILURES" ]; then
+    needs_human "rollback did not restore the deployed identity (head=$head tree=$tree active=$active unit=$unit_sha/${want_sha:-?}; ${SETTLE_FAILURES:-no step reported a failure})"
+    journal aborted "rollback unverified: $reason" 2>/dev/null || true
+    exit 1
+  fi
+  journal_settle report "rollback complete: $reason" ROLLED_BACK
+  if ! freeze_release "rollback: $reason"; then
+    needs_human "rollback restored the deployment but the freeze could not be released: $reason"
+    exit 1
+  fi
   receipt "ROLLED_BACK" "$ARCHIVE/rollback.txt"
   exit 1
 }
 
+verify_post_release() { # <phase> <unit_sha> -- the checks a COMPLETE claim depends on
+  local phase=${1:-released} unit_sha=${2:-} rc hold
+  if [ -z "$unit_sha" ]; then
+    warn "refusing to verify without the regenerated unit's journaled sha256"
+    return 2
+  fi
+  set +e
+  preflight "$phase" >"${ARCHIVE:-/tmp}/verify-preflight-$phase.json" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    warn "post-release preflight NO_GO (phase=$phase, rc=$rc)"
+    return 2
+  fi
+  set +e
+  manifest_verify "$phase" "$unit_sha" >"${ARCHIVE:-/tmp}/verify-manifest-$phase.json" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    warn "post-release manifest verification NO_GO (phase=$phase, rc=$rc)"
+    return 2
+  fi
+  hold=$(systemctl show "$SERVICE" -p Environment --value 2>/dev/null | grep -c 'HERMES_RECOVERY_HOLD=1' || true)
+  if [ "${hold:-0}" -lt 1 ]; then
+    warn "the recovery hold is not set in the service environment"
+    return 2
+  fi
+  return 0
+}
+
 on_exit() {
-  local rc=$?
-  if [ -d "${ARCHIVE:-}" ]; then rm -f "$ARCHIVE/.freeze-alive"; fi
+  local rc=$? decision action mutated_flag=""
+  trap - EXIT INT TERM
+  SETTLING=1
+  if [ -d "${ARCHIVE:-}" ]; then rm -f "$ARCHIVE/.freeze-alive" 2>/dev/null || true; fi
   if [ -n "$KEEPALIVE_PID" ]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; fi
-  # EXT-17 / R-11: `interrupted` is deliberately *not* in this list. A signal is not a licence to
-  # abandon the attempt: an interrupted run must settle like any other failure (rollback if the
-  # install was proven changed, otherwise release only this run's freeze and journal ABORTED_SAFE),
-  # or it leaves the drain marker and ESTOP engaged with no settlement and the next attempt reads a
-  # stale freeze. Phases below have already settled and are left alone.
-  case "$PHASE" in
+  # Only an APPLY settles on exit. --plan/--verify-only/--status mutate nothing and must never write
+  # a terminal record over an attempt they did not run. Settled phases below are left alone.
+  [ "${MODE:-}" = "apply" ] || return 0
+  case "${PHASE:-}" in
     rollback|done|recover|aborted) return 0 ;;
   esac
-  if [ "$rc" -ne 0 ]; then
-    if [ "$MUTATED" -ne 0 ]; then
-      rollback "unhandled failure in phase '$PHASE' (rc=$rc)"
-    elif [ "$FROZEN" -eq 1 ] || [ "$ESTOP_OURS" -eq 1 ]; then
-      freeze_release "aborted in phase '$PHASE' (rc=$rc) before any mutation"
-      journal aborted "aborted before mutation: $PHASE" --result ABORTED_SAFE
-    fi
+  [ "$rc" -ne 0 ] || return 0
+  # EXT-17A: the exit path obeys the same failure contract as abort_before_mutation. It never
+  # restarts blind, never treats a late phase as "nothing happened", and never claims ABORTED_SAFE
+  # for a phase the contract says needs a human.
+  if [ "${JOURNAL_MUTATED:-0}" -ne 0 ] || grep -q '"mutated": true' "$JOURNAL" 2>/dev/null; then
+    mutated_flag="--mutated"
   fi
-}
-trap on_exit EXIT
-# The supervisor's RuntimeMaxSec termination arrives as SIGTERM. Mark the phase and let on_exit
-# settle it; an already-settled phase has nothing to settle and exits without touching state.
-on_signal() {
-  warn "signal received in phase $PHASE"
-  case "$PHASE" in
-    rollback|done|recover|aborted) exit 70 ;;
+  decision=$(ct failure --phase "${PHASE:-unknown}" --restart-attempts "$RESTART_ATTEMPTS" $mutated_flag 2>/dev/null || echo '{}')
+  action=$(printf '%s' "$decision" | env -u PYTHONPATH "$PY3" -c \
+    'import json,sys;print(json.load(sys.stdin).get("action","needs_human"))' 2>/dev/null || echo needs_human)
+  case "$action" in
+    release_freeze)
+      warn "settling an unhandled failure in phase '$PHASE' (rc=$rc): release the freeze, no restart"
+      if [ "$FROZEN" -eq 1 ] || [ "$ESTOP_OURS" -eq 1 ]; then
+        if ! freeze_release "aborted in phase '$PHASE' (rc=$rc) before any mutation"; then
+          needs_human "aborted in phase '$PHASE' (rc=$rc) but the freeze could not be released"
+          journal aborted "aborted in phase '$PHASE': freeze release failed" 2>/dev/null || true
+          exit 1
+        fi
+      fi
+      journal_settle aborted "aborted in phase '$PHASE' (rc=$rc) before any mutation" ABORTED_SAFE
+      ;;
+    rollback)
+      rollback "unhandled failure in phase '$PHASE' (rc=$rc)"
+      ;;
+    *)
+      warn "failure contract for '$PHASE' says '$action': keeping the freeze and leaving state for a human"
+      needs_human "unhandled failure in phase '$PHASE' (rc=$rc): contract says $action"
+      journal aborted "unhandled failure in phase '$PHASE': $action" 2>/dev/null || true
+      ;;
   esac
-  PHASE=interrupted
+}
+
+on_signal() { # a signal is not a settlement: it marks the phase and lets on_exit settle it
+  local sig=${1:-TERM}
+  SIGNAL_SEEN=$sig
+  if [ "$SETTLING" -eq 1 ]; then
+    warn "ignoring $sig while settling phase '$PHASE': the settlement finishes first"
+    return 0
+  fi
+  warn "signal $sig received in phase '$PHASE'"
   exit 70
 }
-trap on_signal INT TERM
+trap 'on_signal TERM' INT TERM
+trap on_exit EXIT
+# ================== EXT-17A: interruption settlement library (END) ==================
 
 # ------------------------------------------------------------------ mode: recover
 if [ "$MODE" = recover ]; then
   PHASE=recover
+  SETTLING=1
+  # EXT-17A: recovery is bound to the attempt the journal records, never to whatever run id the
+  # operator's shell happens to carry. The freeze principal is derived from that id, so a recovery
+  # run using its own id could not release the attempt's freeze -- and could clear a different
+  # attempt's marker. A journal that cannot be read is not "nothing to recover": it is a human.
+  J_STATE=$(ct journal-state --path "$JOURNAL" 2>/dev/null || echo "")
+  J_RUN=$(printf '%s' "$J_STATE" | env -u PYTHONPATH "$PY3" -c 'import json,sys;print(json.load(sys.stdin)["state"]["run_id"] or "")' 2>/dev/null || echo "")
+  J_CAND=$(printf '%s' "$J_STATE" | env -u PYTHONPATH "$PY3" -c 'import json,sys;print(json.load(sys.stdin)["state"]["candidate"] or "")' 2>/dev/null || echo "")
+  if [ -z "$J_RUN" ]; then
+    warn "NEEDS_HUMAN: no readable journal at $JOURNAL; recovery has nothing to bind to"
+    needs_human "recovery without a readable journal"
+    exit 2
+  fi
+  if [ -n "${HERMES_RELEASE_RUN_ID:-}" ] && [ "$HERMES_RELEASE_RUN_ID" != "$J_RUN" ]; then
+    warn "NEEDS_HUMAN: HERMES_RELEASE_RUN_ID=$HERMES_RELEASE_RUN_ID contradicts the journal attempt $J_RUN"
+    needs_human "recovery run id contradicts the journal"
+    exit 2
+  fi
+  if [ -n "$J_CAND" ] && [ "$J_CAND" != "$CANDIDATE" ]; then
+    warn "NEEDS_HUMAN: journal candidate $J_CAND is not the requested $CANDIDATE"
+    needs_human "recovery candidate does not match the journal"
+    exit 2
+  fi
+  if [ "$RUN_ID" != "$J_RUN" ]; then
+    log "recovery bound to the journal's attempt: run_id=$J_RUN (local default was $RUN_ID)"
+    RUN_ID=$J_RUN
+    PRINCIPAL="release-freeze:$RUN_ID"
+  fi
   DEPLOYED_HEAD=$(git -C "$INSTALL" rev-parse HEAD)
   set +e
   PLAN=$(ct recover-plan --journal "$JOURNAL" --repo "$INSTALL" --candidate "$CANDIDATE" --deployed "$EXPECT_HEAD")
@@ -552,17 +847,46 @@ if [ "$MODE" = recover ]; then
   mkdir -p "$ARCHIVE"; printf '%s\n' "$PLAN" >"$ARCHIVE/recover-plan.json"
   case "$ACTION" in
     none) log "nothing to recover"; PHASE=recover; exit 0 ;;
-    unfreeze) FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0); freeze_release "recovery: $REASON"; exit 0 ;;
+    unfreeze)
+      FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0)
+      if ! freeze_release "recovery: $REASON"; then
+        needs_human "recovery could not release the freeze: $REASON"
+        exit 2
+      fi
+      exit 0 ;;
     rollback) MUTATED=1; rollback "recovery: $REASON" ;;
     complete_verification)
-      "$PY" "$ENGINE_DIR/restore002_session_inventory.py" --candidate "$CANDIDATE" --source-repo "$SOURCE" \
-        --json "$ARCHIVE/sessions-after.json" >/dev/null 2>&1 || true
+      # EXT-17A: "complete verification" is a claim about the deployment, so recovery re-derives it
+      # instead of trusting the earlier attempt's phase name, and only then settles COMPLETE.
+      RID_ARGS=()
+      if [ -n "${HERMES_RELEASE_RUN_ID:-}" ]; then RID_ARGS=(--run-id "$HERMES_RELEASE_RUN_ID"); fi
+      set +e
+      POST_UNIT_SHA=$(ct unit-receipt --journal "$JOURNAL" --candidate "$CANDIDATE" \
+                        --unit-path "$UNIT" "${RID_ARGS[@]}" --print sha256 2>"$ARCHIVE/unit-receipt.json")
+      URC=$?
+      set -e
+      if [ "$URC" -ne 0 ] || [ -z "$POST_UNIT_SHA" ]; then
+        warn "NEEDS_HUMAN: no valid regenerated-unit receipt in $JOURNAL (rc=$URC)"
+        [ -f "$ARCHIVE/unit-receipt.json" ] && sed -n '1,40p' "$ARCHIVE/unit-receipt.json" || true
+        needs_human "recovery cannot verify the regenerated unit ($REASON)"
+        exit 2
+      fi
       FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0)
-      freeze_release "recovery: verification completed by operator"
-      journal report "recovered by completing verification" --result COMPLETE
+      if ! verify_post_release "$PHASE" "$POST_UNIT_SHA"; then
+        needs_human "recovery verification NO_GO: $REASON (freeze left engaged)"
+        journal aborted "recovery verification NO_GO: $REASON" 2>/dev/null || true
+        exit 2
+      fi
+      if ! freeze_release "recovery: verification completed by operator"; then
+        needs_human "recovery verified the release but could not restore admission"
+        exit 2
+      fi
+      journal_settle report "recovered by completing verification" COMPLETE
       receipt "RELEASED_VERIFIED" "$ARCHIVE/recover-plan.json"
       exit 0 ;;
-    *) warn "NEEDS_HUMAN: $REASON — the freeze is left in place deliberately"; PHASE=recover; exit 2 ;;
+    *) warn "NEEDS_HUMAN: $REASON — the freeze is left in place deliberately"
+       needs_human "recovery requires a human: $REASON"
+       PHASE=recover; exit 2 ;;
   esac
 fi
 
@@ -618,12 +942,12 @@ HEAD_NOW=$(git -C "$INSTALL" rev-parse HEAD)
 TREE_NOW=$(git -C "$INSTALL" rev-parse HEAD^{tree})
 if [ "$HEAD_NOW" != "$EXPECT_HEAD" ] || [ "$TREE_NOW" != "$EXPECT_TREE" ]; then
   log "NO_GO: install identity is $HEAD_NOW/$TREE_NOW, expected $EXPECT_HEAD/$EXPECT_TREE"
-  journal aborted "identity drift before start" --result ABORTED_SAFE 2>/dev/null || true
+  journal_settle aborted "identity drift before start" ABORTED_SAFE
   exit 2
 fi
 if [ -n "$(git -C "$INSTALL" status --porcelain)" ]; then
   log "NO_GO: install worktree is dirty"
-  journal aborted "dirty worktree before start" --result ABORTED_SAFE 2>/dev/null || true
+  journal_settle aborted "dirty worktree before start" ABORTED_SAFE
   exit 2
 fi
 
@@ -692,7 +1016,7 @@ fi
 if [ "$PF_RC" -ne 0 ]; then
   log "preflight verdict NO_GO (rc=$PF_RC) — nothing was changed"
   grep -E '"(gate|failed|verdict)"' "$ARCHIVE/preflight-before.json" || cat "$ARCHIVE/preflight-before.err"
-  journal aborted "preflight NO_GO rc=$PF_RC" --result ABORTED_SAFE 2>/dev/null || true
+  journal_settle aborted "preflight NO_GO rc=$PF_RC" ABORTED_SAFE
   exit 2
 fi
 log "preflight verdict GO"
@@ -744,9 +1068,20 @@ journal archive "unit, drop-ins, identity and session inventory archived"
 log "archived unit, drop-ins, install identity and session inventory"
 
 # ------------------------------------------------------------ phase 2: freeze admission
+# EXT-17A: admission is not changed until this attempt is durably recorded. A journal that cannot be
+# written is a release that cannot be recovered afterwards, so it is refused here (no marker, no
+# merge) instead of being discovered later as an unattributable freeze.
+journal_require_attempt
 if ! freeze_engage; then
-  freeze_release "freeze could not be established"
-  journal aborted "freeze could not be established" --result ABORTED_SAFE 2>/dev/null || true
+  # EXT-17A: the marker may already be on disk (freeze_engage writes it before it waits for the live
+  # gateway to honour it), so this path owes the attempt a verified release before it may claim
+  # ABORTED_SAFE -- and a durable NEEDS_HUMAN record when that release cannot be verified.
+  if ! freeze_release "freeze could not be established"; then
+    needs_human "freeze could not be established and could not be released"
+    journal aborted "freeze could not be established: freeze release failed" 2>/dev/null || true
+    exit 3
+  fi
+  journal_settle aborted "freeze could not be established" ABORTED_SAFE
   exit 2
 fi
 
@@ -761,8 +1096,13 @@ if [ -z "$FREEZE_SINCE" ]; then
   # Without the freeze epoch, scheduled work claimed during the freeze cannot be attributed and the
   # in-freeze gates are unevaluable. Abort rather than run a release that cannot prove its own safety.
   log "refusing: the freeze epoch is unknown; in-freeze quiescence cannot be attributed"
-  freeze_release "freeze epoch unknown"
-  journal aborted "freeze epoch unknown" --result ABORTED_SAFE 2>/dev/null || true
+  if ! freeze_release "freeze epoch unknown"; then
+    needs_human "the freeze epoch is unknown and the freeze could not be released"
+    journal aborted "freeze epoch unknown: freeze release failed" 2>/dev/null || true
+    receipt "ABORTED_NO_FREEZE_EPOCH" "$ARCHIVE/preflight-before.json" 2>/dev/null || true
+    exit 3
+  fi
+  journal_settle aborted "freeze epoch unknown" ABORTED_SAFE
   receipt "ABORTED_NO_FREEZE_EPOCH" "$ARCHIVE/preflight-before.json"
   exit 3
 fi
@@ -792,8 +1132,13 @@ journal quiesce "quiet samples=$quiet freeze_since=$FREEZE_SINCE principal=$PRIN
 if [ "$quiet" -lt 3 ]; then
   log "no quiescent window within ${QUIESCE_WAIT}s — aborting before any mutation"
   tail -40 "$ARCHIVE/admission-0.err" 2>/dev/null || true
-  freeze_release "not quiet within ${QUIESCE_WAIT}s"
-  journal aborted "not quiet within ${QUIESCE_WAIT}s" --result ABORTED_SAFE 2>/dev/null || true
+  if ! freeze_release "not quiet within ${QUIESCE_WAIT}s"; then
+    needs_human "no quiescent window and the freeze could not be released"
+    journal aborted "not quiet within ${QUIESCE_WAIT}s: freeze release failed" 2>/dev/null || true
+    receipt "ABORTED_NOT_QUIET" "$ARCHIVE/preflight-before.json" 2>/dev/null || true
+    exit 3
+  fi
+  journal_settle aborted "not quiet within ${QUIESCE_WAIT}s" ABORTED_SAFE
   receipt "ABORTED_NOT_QUIET" "$ARCHIVE/preflight-before.json"
   exit 3
 fi
@@ -838,7 +1183,23 @@ journal revalidate "identities and admission revalidated immediately before muta
 PHASE=deploy
 MUTATED=1
 log "fast-forwarding $INSTALL to $CANDIDATE"
-git -C "$INSTALL" merge --ff-only "$CANDIDATE" >"$ARCHIVE/merge.txt" 2>&1 || rollback "fast-forward merge refused"
+# EXT-17A: the first durable proof that a mutation was *attempted*. Without it a SIGKILL between the
+# merge and the deploy receipt leaves a journal that still reads "revalidate, not mutated", and
+# recovery would release the freeze over an installation that is already at the candidate.
+journal deploy-intent "about to fast-forward $INSTALL from $EXPECT_HEAD to $CANDIDATE" --head "$EXPECT_HEAD"
+if ! git -C "$INSTALL" merge --ff-only "$CANDIDATE" >"$ARCHIVE/merge.txt" 2>&1; then
+  # A refused ff-only merge cannot change the install, but "cannot" is not "proven": release the
+  # freeze without a restart only when the install still matches the deployed identity exactly, and
+  # roll back (bounded, verified) otherwise.
+  HEAD=$(git -C "$INSTALL" rev-parse HEAD 2>/dev/null || echo unknown)
+  TREE=$(git -C "$INSTALL" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
+  DIRTY=$(git -C "$INSTALL" status --porcelain 2>/dev/null || echo dirty-unknown)
+  if [ "$HEAD" = "$EXPECT_HEAD" ] && [ "$TREE" = "$EXPECT_TREE" ] && [ -z "$DIRTY" ]; then
+    MUTATED=0
+    abort_before_mutation deploy-intent "fast-forward merge refused; install verified untouched ($HEAD/$TREE, clean)"
+  fi
+  rollback "fast-forward merge refused"
+fi
 HEAD=$(git -C "$INSTALL" rev-parse HEAD)
 TREE=$(git -C "$INSTALL" rev-parse HEAD^{tree})
 if [ "$HEAD" != "$CANDIDATE" ] || [ "$TREE" != "$CAND_TREE" ]; then
@@ -955,7 +1316,15 @@ log "session database: $python_compare"
 journal verify "preflight GO (phase=post), manifest pre+post identities verified, hold set, sessions unchanged, sigkill=0"
 
 # ---------------------------------------------------------- phase 10: restore admission
-freeze_release "release verified"
+# EXT-17A: a verified release that could not release the freeze is not a COMPLETE release. The
+# deployment stays verified, the freeze stays engaged and a human is told exactly that -- the
+# alternative (journaling COMPLETE over a live ESTOP) is the failure mode this section exists for.
+if ! freeze_release "release verified"; then
+  needs_human "release verified and deployed, but admission could not be restored"
+  journal aborted "release verified but the freeze could not be released" 2>/dev/null || true
+  receipt "RELEASED_FREEZE_STUCK" "$ARCHIVE/verification.txt" 2>/dev/null || true
+  exit 4
+fi
 
 # ------------------------------------------------------------------------------ receipt
 PHASE=done
@@ -976,6 +1345,6 @@ PHASE=done
   echo "$STOPLINE"
   echo "$DRAIN"
 } >"$ARCHIVE/verification.txt"
-journal report "release verified" --result COMPLETE
+journal_settle report "release verified" COMPLETE
 receipt "RELEASED_VERIFIED" "$ARCHIVE/verification.txt"
 log "release complete: HEAD=$HEAD TimeoutStopUSec=$EFFECTIVE SIGKILL=${KILLS:-0}"

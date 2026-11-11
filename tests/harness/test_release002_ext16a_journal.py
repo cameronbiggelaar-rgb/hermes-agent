@@ -201,11 +201,13 @@ def test_engine_never_writes_mutation_before_the_merge() -> None:
 
 
 def test_engine_failure_decision_sees_the_journalled_mutation() -> None:
+    """The contract is asked with --mutated when either record says a mutation may have happened."""
     src = engine()
-    block = src[src.index("abort_before_mutation() {"):src.index("rollback() { # $1=reason")]
+    block = src[src.index("abort_before_mutation() {"):src.index("rollback() { # rollback <reason>")]
     assert "ct failure --phase" in block
     assert "grep -q '\"mutated\": true' \"$JOURNAL\"" in block
-    assert "echo --mutated" in block
+    assert 'mutated_flag="--mutated"' in block
+    assert '$mutated_flag' in block
 
 
 def test_receipt_states_the_journal_mutation_state() -> None:
