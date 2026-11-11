@@ -27,6 +27,9 @@ class GatewayRuntimeInitMixin:
         # boot — launchd fixes it at load — and applied only to signal-driven stops, which are the
         # only stops launchd times. See _load_launchd_exit_timeout().
         self._stop_requested_by_signal = False
+        # Live systemd TimeoutStopSec (None until the boot-time alignment probe fills it): caps the
+        # drain and the shutdown-watchdog leash so the teardown after the drain is never SIGKILLed.
+        self._systemd_timeout_stop_sec: Optional[float] = None
         self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(self._restart_drain_timeout)
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
