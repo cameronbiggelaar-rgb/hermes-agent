@@ -443,9 +443,17 @@ PYEOF
   mkdir -p /var/lib/hermes-release/restore-002 "$(dirname "$archive")"
   log "candidate $CANDIDATE | supervisor RuntimeMaxSec=${runtime_max}s | run $run_id"
   systemctl reset-failed "hermes-release-$run_id.service" 2>/dev/null || true
+  # EXT-17 / R-11: the supervisor runs as a *service* type, not Type=oneshot. systemd documents
+  # RuntimeMaxSec as having no effect in combination with Type=oneshot — it logs "RuntimeMaxSec= has
+  # no effect in combination with Type=oneshot. Ignoring." while loading the unit, and the envelope
+  # cap is inert (reproduced on this host with a throwaway unit). Type=exec keeps the semantics the
+  # engine already has — one process, one exit status, nothing left behind — and makes the cap real:
+  # at the budget the unit gets KillSignal (SIGTERM), the engine's own trap settles the attempt
+  # (freeze released, journal ABORTED_SAFE before any mutation), and SendSIGKILL covers a settlement
+  # that itself hangs.
   local args=(
     --unit="hermes-release-$run_id" --description="RESTORE-002 release supervisor ($CANDIDATE)"
-    --collect --property=Type=oneshot --property=RuntimeMaxSec="$runtime_max"
+    --collect --property=Type=exec --property=RuntimeMaxSec="$runtime_max"
     --property=TimeoutStopSec=420 --property=KillMode=control-group --property=SendSIGKILL=yes
     --property=WorkingDirectory="$LIB" --property=StandardOutput=append:"$logfile"
     --property=StandardError=append:"$logfile"

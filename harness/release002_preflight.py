@@ -68,12 +68,18 @@ GW_STATE = f"{HERMES_HOME}/gateway_state.json"
 DRAIN_MARKER = f"{HERMES_HOME}/.drain_request.json"
 ESTOP_MARKER = f"{HERMES_HOME}/ESTOP"
 
-# Expected identities. e05128fe is the verified RESTORE-001 installation the owner ordered preserved;
-# the release replaces it with the qualified Fault B commit, so the *candidate* is passed in.
-DEFAULT_INSTALL_HEAD = "e05128febbc559469a5fb835a9235a543dfdfa64"
-DEFAULT_INSTALL_TREE = "dc05abd074c834569cf19ca89a6446d74be5c41d"
+# Expected identities. 3652a370 is the installation the corrected candidate is reconciled against:
+# production moved off RESTORE-001's e05128fe on 2026-11-09 (upstream main plus four replayed local
+# commits) and must not be reset, so the release replaces *that* tree with the qualified candidate,
+# which is passed in. Both are overridable (--expect-head/--expect-tree) and the manifest pins them.
+DEFAULT_INSTALL_HEAD = "3652a3702dae8d2917b91b6949da580efd3ef496"
+DEFAULT_INSTALL_TREE = "3bfc1c842bf76e8a95356f4f0f3a91e75767992c"
 HOLD_DROPIN_SHA256 = "ba4a1c11558b53e2d96834580ef82690c6c3d7c4f1eda11cbbde5480a835dba0"
 QUIET_WINDOW_S = 120.0
+# EXT-17 / R-13: how stale the gateway's own liveness heartbeat may be before the counters this
+# sample just read stop being evidence. Freshness is an upper bound on age — the heartbeat is *not*
+# the quiet clock any more, it is the proof that the state file is current.
+HEARTBEAT_MAX_S = 180.0
 GIB = float(1 << 30)
 
 
@@ -320,6 +326,14 @@ def session_state(quiet_window_s: float = QUIET_WINDOW_S, *, candidate: str | No
         ).hexdigest()
     except Exception as exc:  # noqa: BLE001 - any failure here is a fail-closed signal
         return {"error": f"pinned planner failed: {type(exc).__name__}: {exc}", "planner": evidence}
+    # EXT-17 / R-13: the interval a stop must wait out is dated from *work*, not from liveness.
+    # ``last_ts`` is the session row's ``last_activity_at``: it moves when a turn writes, and it stays
+    # put while the gateway merely heartbeats. ``gateway_state.updated_at`` is the opposite — rewritten
+    # every few seconds even inside a freeze — and ageing it was the defect that made the quiet window
+    # unsatisfiable. Measured over every session, open *and* ended: a conversation that ends and then
+    # writes again is still work, and an ended row is the cheapest place for it to hide.
+    stamps = [(float(f.last_ts), f.session_id) for f in facts if f.last_ts]
+    newest_ts, newest_id = max(stamps, key=lambda x: x[0]) if stamps else (None, None)
     recent = [f.session_id for f in open_facts if (f.last_ts or 0.0) >= now - quiet_window_s]
     return {
         "open": len(open_facts),
@@ -330,7 +344,65 @@ def session_state(quiet_window_s: float = QUIET_WINDOW_S, *, candidate: str | No
         "quiet_window_s": quiet_window_s,
         "planner": evidence,
         "planner_source": "pinned-candidate-blob",
+        "newest_activity_epoch": newest_ts,
+        "newest_activity_session": newest_id,
+        "newest_activity_age_s": (now - newest_ts) if newest_ts is not None else None,
     }
+
+
+def heartbeat_age_s(gw_state: dict, *, now: float) -> float | None:
+    """Age of the gateway's own liveness heartbeat, or None when it cannot be dated.
+
+    R-13 (EXT-17): this is evidence that the counters read in the same sample are *current*. It is
+    not, and must not again become, the clock the quiet interval is measured against —
+    ``gateway_state.updated_at`` is rewritten every few seconds whether or not any work is running,
+    including inside a freeze, so ageing it made the interval unsatisfiable on a live gateway.
+    """
+    if not isinstance(gw_state, dict) or "error" in gw_state:
+        return None
+    stamp = _stamp(gw_state.get("updated_at") or gw_state.get("last_activity_at"))
+    return None if not stamp else now - stamp
+
+
+def quiet_anchor(*, state: dict, freeze_since: float | None,
+                 now: float) -> tuple[float | None, str]:
+    """The instant the quiet interval is dated from, plus a readable account of it.
+
+    The later of (a) the newest recorded *work* — the session store's ``last_activity_at`` across
+    every session, open or ended, because a conversation that ends and then writes again is still
+    work — and (b) the freeze instant, since admission is closed from that moment and nothing new can
+    start after it. Taking the later of the two can only understate idleness, and it keeps the gate
+    evaluable when the store's last write is older than the window (the ordinary case: the previous
+    turn). ``(None, why)`` means the interval is genuinely unevaluable — no store, no freeze — and
+    the caller must fail closed rather than assume idleness.
+    """
+    if not isinstance(state, dict) or "error" in state:
+        return None, f"work clock unavailable: {(state or {}).get('error', 'no session state')}"
+    anchors: list[float] = []
+    if isinstance(freeze_since, (int, float)):
+        anchors.append(float(freeze_since))
+    # Prefer the raw epoch over the derived age: the age was measured when the store was read, and
+    # re-deriving an instant from it would make the interval grow by however long the sample took.
+    # Overstating idleness is the one direction this gate must never be wrong in.
+    work_epoch = state.get("newest_activity_epoch")
+    work_age = state.get("newest_activity_age_s")
+    work_instant: float | None = None
+    if isinstance(work_epoch, (int, float)):
+        work_instant = float(work_epoch)
+    elif isinstance(work_age, (int, float)):
+        work_instant = now - float(work_age)
+    if work_instant is not None:
+        anchors.append(work_instant)
+    if not anchors:
+        return None, ("no work clock: neither the freeze instant nor a session activity stamp is "
+                      "available")
+    freeze_age = (format(now - float(freeze_since), ".0f") + "s"
+                  if isinstance(freeze_since, (int, float)) else "n/a")
+    work_age_now = None if work_instant is None else max(0.0, now - work_instant)
+    detail = (f"newest_session={state.get('newest_activity_session')!r} "
+              f"work_age={'n/a' if work_age_now is None else format(work_age_now, '.0f') + 's'} "
+              f"freeze_age={freeze_age}")
+    return max(anchors), detail
 
 
 def db_stats() -> dict:
@@ -467,6 +539,10 @@ def main() -> int:
                     help="repository holding the candidate (default: the installation); the pinned "
                          "session planner is read from this repo's git objects, never from an import")
     ap.add_argument("--quiet-window", type=float, default=QUIET_WINDOW_S)
+    ap.add_argument("--heartbeat-max", type=float, default=HEARTBEAT_MAX_S,
+                    help="seconds gateway_state.updated_at may lag before its counters stop being "
+                         "evidence (in-freeze phases); freshness is a liveness cross-check, not the "
+                         "quiet clock — the quiet interval is dated from session work (EXT-17/R-13)")
     ap.add_argument("--phase", choices=["pre", "infreeze", "revalidate", "post", "released", "any"],
                     default="pre",
                     help="pre = before the freeze (never asserts quiescence); infreeze = after the "
@@ -632,7 +708,8 @@ def main() -> int:
     QUIESCENCE_GATES = ("no_active_agents", "no_live_admissions", "admission_counters_consistent",
                         "freeze_owned_by_attempt", "freeze_since_attributable",
                         "freeze_guards_engaged", "cron_inflight_zero",
-                        "cron_no_claims_after_freeze", "quiet_window_elapsed")
+                        "cron_no_claims_after_freeze", "gateway_heartbeat_fresh",
+                        "quiet_window_elapsed")
     if in_freeze:
         adm = release002_control.admission_report(
             principal=args.principal, marker_max_age=args.marker_max_age)
@@ -680,12 +757,28 @@ def main() -> int:
         else:
             g.add("cron_no_claims_after_freeze",
                   cron["post_freeze_claims"] == 0 if cron["evaluable"] else None, cron["detail"])
-        if "error" in gw_state:
-            g.add("quiet_window_elapsed", None, "gateway_state unreadable; cannot date the last activity")
-        else:
-            since_last = time.time() - _stamp(gw_state.get("updated_at") or gw_state.get("last_activity_at"))
-            g.add("quiet_window_elapsed", since_last >= args.quiet_window,
-                  f"since_last_activity={since_last:.0f}s window={args.quiet_window:.0f}s")
+        # EXT-17 / R-13: two questions, two instruments, and no substitution between them.
+        #
+        #   gateway_heartbeat_fresh — is the state file this sample just read current?
+        #   quiet_window_elapsed    — has *work* been absent for the whole window?
+        #
+        # The previous code asked the second question with the first instrument: it aged
+        # ``gateway_state.updated_at``, the gateway's own liveness heartbeat, which is rewritten every
+        # few seconds whether or not anything is running — including while the machine is frozen. A
+        # live gateway could therefore never satisfy a >= 120 s threshold (RESTORE-002 attempt 3 took
+        # nine samples across 180 s, none qualifying, and aborted "no quiescent window"), so no
+        # candidate could ever reach the mutation phase on a healthy host. Dated from work, the same
+        # window means what it was meant to mean, and freshness still guards against a stale file.
+        now = time.time()
+        age = heartbeat_age_s(gw_state, now=now)
+        g.add("gateway_heartbeat_fresh", None if age is None else age <= args.heartbeat_max,
+              "gateway_state unreadable: liveness cannot be established" if age is None
+              else f"heartbeat_age={age:.0f}s max={args.heartbeat_max:.0f}s")
+        anchor, why = quiet_anchor(state=state, freeze_since=args.freeze_since, now=now)
+        g.add("quiet_window_elapsed",
+              None if anchor is None else (now - anchor) >= args.quiet_window,
+              why if anchor is None
+              else f"since_last_work={now - anchor:.0f}s window={args.quiet_window:.0f}s {why}")
     else:
         for name in QUIESCENCE_GATES:
             g.add(name, None, "pending: only evaluable inside the admission freeze", deferred=True)

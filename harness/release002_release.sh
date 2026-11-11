@@ -52,8 +52,11 @@ ENGINE_DIR=$(cd "$(dirname "$0")" && pwd)
 ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=$INSTALL/venv/bin/python
 PY3=/usr/bin/python3.13
-EXPECT_HEAD=${EXPECT_HEAD:-e05128febbc559469a5fb835a9235a543dfdfa64}
-EXPECT_TREE=${EXPECT_TREE:-dc05abd074c834569cf19ca89a6446d74be5c41d}
+# EXT-17: the installation this candidate is reconciled against. Production is 3652a370 since the
+# 2026-11-09 upgrade and is not reset by this release; the manifest pins both values, and these
+# defaults only have to agree with it.
+EXPECT_HEAD=${EXPECT_HEAD:-3652a3702dae8d2917b91b6949da580efd3ef496}
+EXPECT_TREE=${EXPECT_TREE:-3bfc1c842bf76e8a95356f4f0f3a91e75767992c}
 MAX_QUIESCE=${MAX_QUIESCE:-180}
 QUIESCE_WAIT=${QUIESCE_WAIT:-180}
 STARTUP_WAIT=${STARTUP_WAIT:-240}
@@ -504,8 +507,13 @@ on_exit() {
   local rc=$?
   if [ -d "${ARCHIVE:-}" ]; then rm -f "$ARCHIVE/.freeze-alive"; fi
   if [ -n "$KEEPALIVE_PID" ]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; fi
+  # EXT-17 / R-11: `interrupted` is deliberately *not* in this list. A signal is not a licence to
+  # abandon the attempt: an interrupted run must settle like any other failure (rollback if the
+  # install was proven changed, otherwise release only this run's freeze and journal ABORTED_SAFE),
+  # or it leaves the drain marker and ESTOP engaged with no settlement and the next attempt reads a
+  # stale freeze. Phases below have already settled and are left alone.
   case "$PHASE" in
-    rollback|done|recover|aborted|interrupted) return 0 ;;
+    rollback|done|recover|aborted) return 0 ;;
   esac
   if [ "$rc" -ne 0 ]; then
     if [ "$MUTATED" -ne 0 ]; then
@@ -517,7 +525,17 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
-trap 'PHASE=interrupted; warn "signal received in phase $PHASE"; exit 70' INT TERM
+# The supervisor's RuntimeMaxSec termination arrives as SIGTERM. Mark the phase and let on_exit
+# settle it; an already-settled phase has nothing to settle and exits without touching state.
+on_signal() {
+  warn "signal received in phase $PHASE"
+  case "$PHASE" in
+    rollback|done|recover|aborted) exit 70 ;;
+  esac
+  PHASE=interrupted
+  exit 70
+}
+trap on_signal INT TERM
 
 # ------------------------------------------------------------------ mode: recover
 if [ "$MODE" = recover ]; then

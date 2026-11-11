@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DRIVER = ROOT / "harness" / "release002_driver.sh"
 
 CAND = "16a4d39a418f16ebac8eeb27ce7585158ce9e8ef"
-HEAD = "e05128febbc559469a5fb835a9235a543dfdfa64"
+HEAD = "3652a3702dae8d2917b91b6949da580efd3ef496"
 TREE = "3ff43dc4aed41d3cc8bbe8df527aedbd6b77466f"
 PID = "4242"
 

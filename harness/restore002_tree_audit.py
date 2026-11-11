@@ -9,7 +9,7 @@ import sys
 
 W = "/home/hermes/work/restore002-fix"
 BASE = "5d02e1da"          # PR #9 head the owner reviewed
-DEPLOYED = "e05128fe"      # verified live install
+DEPLOYED = "3652a370"      # verified live install (EXT-17 baseline)
 
 
 def git(*args):

@@ -39,7 +39,7 @@ import release002_control as ctl  # noqa: E402
 import release002_preflight as pf  # noqa: E402
 
 CAND = "ffe95da10804ff29571239c3ea33aca7b606b185"
-HEAD = "e05128febbc559469a5fb835a9235a543dfdfa64"
+HEAD = "3652a3702dae8d2917b91b6949da580efd3ef496"
 TREE = "dc7555b7d09e0f20ae04679dadc84f63731f23a0"
 PID = "4242"
 PRINCIPAL = "release-freeze:test"

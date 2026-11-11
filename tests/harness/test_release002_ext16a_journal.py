@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT / "harness"))
 import release002_control as ctl  # noqa: E402
 
 CANDIDATE = "450a93872d5be7b6e5b14c0a523a3b0c26e08945"
-BASELINE = "e05128febbc559469a5fb835a9235a543dfdfa64"
+BASELINE = "3652a3702dae8d2917b91b6949da580efd3ef496"
 
 
 def engine() -> str:
