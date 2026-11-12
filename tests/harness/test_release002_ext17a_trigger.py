@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -131,6 +132,40 @@ def test_a_refused_launch_is_recorded_as_failed_and_exits_non_zero(tmp_path: Pat
     assert record["apply_rc"] == 64
     assert record["engine_run_id"] == ""
     assert "no retry from this trigger" in (box["state"] / "qw-launcher.log").read_text()
+
+
+def test_a_launcher_that_never_returns_is_abandoned_at_the_deadline(tmp_path: Path) -> None:
+    """The deadline bounds the call, not only the wait for a quiet window.
+
+    A launcher that never returns used to leave the trigger blocked with the record stuck at
+    ``pending``: nobody could tell whether an attempt had started, and the trigger never disarmed.
+    """
+    box = sandbox(tmp_path)
+    pidfile = tmp_path / "child.pid"
+    box["launcher"].write_text(
+        "#!/bin/bash\n"
+        f'echo "CALL apply" >>"{box["calls"]}"\n'
+        f'echo $$ >"{pidfile}"\n'
+        "sleep 60\n"
+        "exit 0\n"
+    )
+    box["launcher"].chmod(0o755)
+    result = run(box, need=1, interval=1, deadline=5, timeout=90)
+    assert result.returncode == 5, result.stdout + result.stderr
+    record = fired_record(box)
+    assert record["status"] == "failed"
+    assert record["apply_rc"] == 124
+    assert "DEADLINE" in (box["state"] / "qw-launcher.log").read_text()
+    assert pidfile.exists(), "the launcher never ran"
+    pid = int(pidfile.read_text().strip())
+    proc = Path(f"/proc/{pid}")
+    # /proc is the honest check here: os.kill() from this process is blocked by the suite's own
+    # live-system guard, and a process that is gone from /proc is gone.
+    for _ in range(30):
+        if not proc.exists():
+            break
+        time.sleep(0.1)
+    assert not proc.exists(), f"the launcher child {pid} outlived the deadline"
 
 
 def test_a_launcher_that_reports_no_run_id_is_not_reported_as_fired(tmp_path: Path) -> None:

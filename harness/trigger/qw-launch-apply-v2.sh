@@ -164,7 +164,13 @@ log "quiet window confirmed ($NEED x ${INTERVAL}s) — recording the attempt and
 write_fired pending 0 ""
 
 # Trust is granted for exactly two repositories, as /etc/gitconfig does; never for '*'.
-out=$(HERMES_RELEASE_APPROVAL=$CAND \
+# The attempt deadline bounds the call, not just the wait for a quiet window: a launcher that never
+# returns would otherwise leave this trigger blocked forever and the record stuck at `pending`, which
+# is the state nobody can act on. `--kill-after` makes sure the child is gone even if it ignores TERM.
+remaining=$((end - $(date +%s)))
+[ "$remaining" -ge 10 ] || remaining=10
+out=$(timeout --kill-after=5 "$remaining" \
+      env HERMES_RELEASE_APPROVAL=$CAND \
       HERMES_RELEASE_EXPECT_HEAD=$EXPECT_HEAD \
       GIT_CONFIG_COUNT=2 \
       GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/home/hermes/.hermes/hermes-agent \
@@ -177,6 +183,15 @@ if [ "$rc" -eq 0 ]; then
   run_id=$(printf '%s\n' "$out" | sed -n 's/.*supervisor started detached: hermes-release-\(.*\)\.service.*/\1/p' | head -1)
 fi
 log "apply rc=$rc engine_run_id=${run_id:-UNKNOWN}"
+
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  # The launcher was still running at the deadline. Whether it started a supervisor is now unknowable
+  # from here, so the attempt is recorded as spent and the operator must read the journal: this
+  # trigger will not fire again either way.
+  write_fired failed "$rc" ""
+  log "DEADLINE: the launcher did not return within ${remaining}s — attempt recorded as spent, verify the journal before retrying"
+  exit 5
+fi
 
 if [ "$rc" -ne 0 ] || [ -z "$run_id" ]; then
   # Nothing is running: the attempt is not spent, and the record says so instead of claiming a fire.
