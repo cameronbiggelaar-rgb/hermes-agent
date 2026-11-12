@@ -182,6 +182,9 @@ PY
     # file, so it would report zero and the window would qualify over live work; the trigger must
     # refuse instead, and must still fire once that same row is terminal.
     run plan "$Q" plan
+    # The fixture store is created in rollback mode; put it in WAL so the claim under test is the real
+    # one — committed frames sitting in an uncheckpointed -wal.
+    sqlite3 "$HOME/state.db" 'pragma journal_mode=wal;' >/dev/null 2>&1
     /usr/bin/python3.13 - "$HOME/state.db" "$STATE/wal-writer.pid" >"$ARCHIVE/step-wal-writer.log" 2>&1 <<'PY' &
 import pathlib, sqlite3, sys, time
 db, pidfile = sys.argv[1], sys.argv[2]
@@ -196,8 +199,16 @@ time.sleep(900)
 PY
     wallet_pid=$!
     for _ in $(seq 1 30); do [ -s "$STATE/wal-writer.pid" ] && break; sleep 0.2; done
-    # The WAL must actually hold frames, or the case would prove nothing.
-    say wal-bytes "$(stat -c %s "$HOME/state.db-wal" 2>/dev/null || echo 0)"
+    # The WAL must actually hold frames, or the case would prove nothing: 0 means the commit already
+    # reached the main file and the sample below would prove nothing about WAL visibility.
+    wallet=0
+    for _ in $(seq 1 50); do
+      wallet=$(stat -c %s "$HOME/state.db-wal" 2>/dev/null || echo 0)
+      [ "$wallet" -gt 0 ] && break
+      sleep 0.2
+    done
+    if [ "$wallet" -gt 0 ]; then say wal-has-frames 0; else say wal-has-frames 1; fi
+    say wal-bytes "$wallet"
     fire() { # fire <state-dir> <candidate> <deadline>
       TRIGGER_QUALIFY=1 TRIGGER_STATE="$1" \
       TRIGGER_PW="$HOME/gateway_state.json" TRIGGER_DB="$HOME/state.db" \
@@ -207,7 +218,7 @@ PY
     }
     # Live admission in a hot, uncheckpointed WAL: no quiet window, no attempt armed.
     run trigger-wal-live fire "$STATE/armed-wal" "$CAND" 8
-    say fired-record "$([ -e "$STATE/armed-wal/attempt-fired.json" ] && echo present || echo absent)"
+    [ -e "$STATE/armed-wal/attempt-fired.json" ] && say armed-despite-busy 1 || say armed-despite-busy 0
     kill "$wallet_pid" 2>/dev/null || true
     wait "$wallet_pid" 2>/dev/null || true
     # Same row, now terminal: the window must open and the single handoff must happen for real.
