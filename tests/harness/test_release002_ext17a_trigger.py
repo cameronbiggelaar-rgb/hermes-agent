@@ -34,8 +34,21 @@ def sandbox(tmp_path: Path, *, agents: int = 0) -> dict[str, Path]:
     pw.write_text(json.dumps({"active_agents": agents, "gateway_state": "ready"}))
     db = tmp_path / "state.db"
     con = sqlite3.connect(db)
-    con.execute("create table session_admissions (owner_epoch integer, status text)")
-    con.execute("insert into session_admissions values (1, 'ended')")
+    # The sandbox store carries the three relations the trigger's observation reads: the runtime
+    # epoch is the authority for "current", sessions carry the activity age of a stale admission,
+    # and a terminal row in the current epoch must never block a window.
+    con.executescript(
+        """
+        create table sessions (id text primary key, last_activity_at real);
+        create table runtime_epoch (singleton integer primary key, epoch integer);
+        create table session_admissions (
+            admission_id text primary key, owner_epoch integer, status text, target_session_id text);
+        """
+    )
+    con.execute("insert into runtime_epoch values (1, 7)")
+    con.execute("insert into sessions values ('sandbox-1', ?)", (time.time(),))
+    con.execute(
+        "insert into session_admissions values ('sandbox-terminal', 7, 'terminal', 'sandbox-1')")
     con.commit()
     con.close()
 

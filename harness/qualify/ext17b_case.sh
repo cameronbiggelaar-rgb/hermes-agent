@@ -10,6 +10,7 @@
 #   interrupt        a TERM during the restart must settle, not abandon, the run
 #   timeout          a restart that never stops must settle at the 300 s budget
 #   trigger          trigger v2 must hand off exactly once into the qualified supervisor
+#   wal-live         a live admission committed into an uncheckpointed WAL must block the window
 #
 # Every case prints `CASE=<name> STEP=<step> RC=<n>` lines for each step and nothing else on stdout;
 # the evidence (journal, archive, install identity, gateway state) is read from the case root by the
@@ -167,6 +168,51 @@ PY
     run trigger fire "$STATE/armed" "$CAND" 120
     run trigger-again fire "$STATE/armed" "$CAND" 5
     # The supervisor the trigger started detached must finish on its own: wait for its journal.
+    for _ in $(seq 1 420); do
+      grep -q '"result"' /var/lib/hermes-release/restore-002/journal.json 2>/dev/null && break
+      sleep 1
+    done
+    run status "$Q" status
+    ;;
+
+  wal-live)
+    # EXT-17C §1, end to end. The fixture store is opened in WAL mode with autocheckpoint off and a
+    # queued admission for the current epoch is committed and left in the -wal, with the writer still
+    # open: the shape of a gateway that has just admitted a session. `immutable=1` reads only the main
+    # file, so it would report zero and the window would qualify over live work; the trigger must
+    # refuse instead, and must still fire once that same row is terminal.
+    run plan "$Q" plan
+    /usr/bin/python3.13 - "$HOME/state.db" "$STATE/wal-writer.pid" >"$ARCHIVE/step-wal-writer.log" 2>&1 <<'PY' &
+import pathlib, sqlite3, sys, time
+db, pidfile = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+con.execute("pragma wal_autocheckpoint=0")
+con.execute("insert into session_admissions (admission_id, owner_epoch, status, target_session_id)"
+            " values ('wal-live-1', (select epoch from runtime_epoch where singleton=1),"
+            " 'queued', 'fixture-open-1')")
+con.commit()
+pathlib.Path(pidfile).write_text(str(__import__("os").getpid()))
+time.sleep(900)
+PY
+    wallet_pid=$!
+    for _ in $(seq 1 30); do [ -s "$STATE/wal-writer.pid" ] && break; sleep 0.2; done
+    # The WAL must actually hold frames, or the case would prove nothing.
+    say wal-bytes "$(stat -c %s "$HOME/state.db-wal" 2>/dev/null || echo 0)"
+    fire() { # fire <state-dir> <candidate> <deadline>
+      TRIGGER_QUALIFY=1 TRIGGER_STATE="$1" \
+      TRIGGER_PW="$HOME/gateway_state.json" TRIGGER_DB="$HOME/state.db" \
+      TRIGGER_LAUNCHER="$INSTALLED" TRIGGER_NEED=2 TRIGGER_INTERVAL=1 \
+      TRIGGER_DEADLINE_S="$3" \
+        "$TRIGGER" --candidate "$2" --expect-head "$BASE"
+    }
+    # Live admission in a hot, uncheckpointed WAL: no quiet window, no attempt armed.
+    run trigger-wal-live fire "$STATE/armed-wal" "$CAND" 8
+    say fired-record "$([ -e "$STATE/armed-wal/attempt-fired.json" ] && echo present || echo absent)"
+    kill "$wallet_pid" 2>/dev/null || true
+    wait "$wallet_pid" 2>/dev/null || true
+    # Same row, now terminal: the window must open and the single handoff must happen for real.
+    sqlite3 "$HOME/state.db" "update session_admissions set status='terminal' where admission_id='wal-live-1';"
+    run trigger-wal-settled fire "$STATE/armed-wal" "$CAND" 120
     for _ in $(seq 1 420); do
       grep -q '"result"' /var/lib/hermes-release/restore-002/journal.json 2>/dev/null && break
       sleep 1

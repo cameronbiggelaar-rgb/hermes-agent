@@ -107,7 +107,8 @@ write_fired() { # write_fired <status> <apply_rc> <run_id>  — atomic, so a cra
   "quiet_samples": $NEED,
   "sample_interval_s": $INTERVAL,
   "launcher": "$LAUNCHER",
-  "trigger_version": "v2"
+  "admission_read_mode": "mode=ro",
+  "trigger_version": "v2.1"
 }
 EOF
   mv -f "$tmp" "$FIRED" && chmod 0644 "$FIRED"
@@ -126,7 +127,69 @@ trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 
 start=$(date +%s); end=$((start + DEADLINE_S))
-log "ARM v2 label=PRODEXEC01-ATTEMPT-1 candidate=$CAND expect_head=$EXPECT_HEAD need=$NEED interval=${INTERVAL}s deadline_s=$DEADLINE_S"
+log "ARM v2.1 label=PRODEXEC01-ATTEMPT-1 candidate=$CAND expect_head=$EXPECT_HEAD need=$NEED interval=${INTERVAL}s deadline_s=$DEADLINE_S"
+
+# Admission observation. `immutable=1` reads the main database file and ignores the -wal, so an
+# admission committed since the last checkpoint is invisible and a multi-sample window can qualify
+# over live work. `mode=ro` participates in WAL indexing, so it is the only read allowed to prove
+# quiet. Every failure — unopenable, unparseable, absent epoch, an undated row, a stale-epoch row too
+# young to be provably dead — is a refusal, never a zero.
+ADMISSION_SQL="
+select (select epoch from runtime_epoch where singleton=1),
+       (select count(*) from session_admissions
+         where status in ('queued','started','unknown')
+           and owner_epoch=(select epoch from runtime_epoch where singleton=1)),
+       (select count(*) from session_admissions
+         where status in ('queued','started','unknown')
+           and owner_epoch>(select epoch from runtime_epoch where singleton=1)),
+       (select count(*) from session_admissions a
+          left join sessions s on s.id=a.target_session_id
+         where a.status in ('queued','started','unknown')
+           and a.owner_epoch<(select epoch from runtime_epoch where singleton=1)
+           and (s.last_activity_at is null
+                or (cast(strftime('%s','now') as real)-s.last_activity_at) <= 21600)),
+       (select count(*) from session_admissions a
+          left join sessions s on s.id=a.target_session_id
+         where a.status in ('queued','started','unknown')
+           and a.owner_epoch<(select epoch from runtime_epoch where singleton=1)
+           and s.last_activity_at is not null
+           and (cast(strftime('%s','now') as real)-s.last_activity_at) > 21600),
+       (select count(*) from session_admissions
+         where status in ('queued','started','unknown') and owner_epoch is null);"
+
+# A stale-epoch row is only provably dead once its session activity is older than the engine's own
+# stale-admission horizon (release002_control STALE_ADMISSION_HOURS = 6). Younger ones might belong
+# to a runtime that has not finished draining, so they block quiet instead of being written off.
+ADM_STALE_HORIZON_S=21600
+
+observe_admissions() { # sets ADM_STATE + six counts; returns 1 only when nothing could be read
+  local raw f
+  ADM_STATE=unreadable
+  raw=$(sqlite3 "file:$DB?mode=ro" "$ADMISSION_SQL" 2>/dev/null) || return 1
+  case "$raw" in '' | *[!0-9'|']*) return 1 ;; esac
+  IFS='|' read -r ADM_EPOCH ADM_LIVE ADM_AHEAD ADM_STALE_RECENT ADM_STALE_EXPIRED ADM_UNDATED <<<"$raw"
+  for f in "$ADM_EPOCH" "$ADM_LIVE" "$ADM_AHEAD" "$ADM_STALE_RECENT" "$ADM_STALE_EXPIRED" "$ADM_UNDATED"; do
+    case "$f" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  [ "$ADM_EPOCH" -ge 1 ] || return 1
+  if [ "$ADM_LIVE" -ne 0 ] || [ "$ADM_AHEAD" -ne 0 ] || \
+     [ "$ADM_STALE_RECENT" -ne 0 ] || [ "$ADM_UNDATED" -ne 0 ]; then
+    ADM_STATE=busy
+    return 0
+  fi
+  ADM_STATE=quiet
+  return 0
+}
+
+wal_bytes() { stat -c %s "$DB-wal" 2>/dev/null || echo 0; }
+
+# The instrument must work before an attempt is armed: a store that cannot be read cannot be
+# qualified quiet, and arming blind would spend the single attempt on a guess.
+if ! observe_admissions; then
+  log "REFUSE at arm: admission state is $ADM_STATE (db=$DB) — no attempt is armed"
+  exit 64
+fi
+log "admission observation mode=ro epoch=$ADM_EPOCH live=$ADM_LIVE ahead=$ADM_AHEAD stale_recent=$ADM_STALE_RECENT stale_expired=$ADM_STALE_EXPIRED undated=$ADM_UNDATED wal_bytes=$(wal_bytes)"
 
 quiet=0
 while :; do
@@ -134,12 +197,12 @@ while :; do
   [ "$now" -ge "$end" ] && break
 
   agents=$(/usr/bin/python3.13 -c "import json;print(json.load(open('$PW')).get('active_agents'))" 2>/dev/null || echo ERR)
-  live=$(sqlite3 "file:$DB?immutable=1" "select count(*) from session_admissions where status in ('queued','started') and owner_epoch=(select max(owner_epoch) from session_admissions);" 2>/dev/null || echo ERR)
-  orphans=$(sqlite3 "file:$DB?immutable=1" "select count(*) from session_admissions where status in ('queued','started') and owner_epoch<(select max(owner_epoch) from session_admissions);" 2>/dev/null || echo ERR)
+  observe_admissions
 
-  # An unreadable instrument is not a quiet host: only two literal zeroes advance the window.
-  if [ "$agents" = "0" ] && [ "$live" = "0" ]; then quiet=$((quiet + 1)); else quiet=0; fi
-  log "sample agents=$agents live_admissions=$live stale_epoch_live=$orphans quiet=$quiet/$NEED"
+  # Only an exact all-zero observation advances the window. An unreadable store, an unknown epoch,
+  # a stale-but-recent admission or an undated row all reset it.
+  if [ "$agents" = "0" ] && [ "$ADM_STATE" = "quiet" ]; then quiet=$((quiet + 1)); else quiet=0; fi
+  log "sample agents=$agents admissions=$ADM_STATE epoch=${ADM_EPOCH:-?} live=${ADM_LIVE:-?} ahead=${ADM_AHEAD:-?} stale_recent=${ADM_STALE_RECENT:-?} stale_expired=${ADM_STALE_EXPIRED:-?} undated=${ADM_UNDATED:-?} wal_bytes=$(wal_bytes) quiet=$quiet/$NEED"
   [ "$quiet" -ge "$NEED" ] && break
 
   now=$(date +%s)

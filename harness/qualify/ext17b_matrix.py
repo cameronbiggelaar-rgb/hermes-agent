@@ -45,9 +45,10 @@ FLAGS: dict[str, list[str]] = {
     "interrupt": ["--stop-mode", "hang"],
     "timeout": ["--stop-mode", "hang"],
     "trigger": [],
+    "wal-live": [],
 }
 ORDER = ["dirty", "foreign-freeze", "busy", "rollback", "needs-human", "interrupt", "timeout",
-         "trigger"]
+         "trigger", "wal-live"]
 
 
 def git(path: Path, *args: str) -> str:
