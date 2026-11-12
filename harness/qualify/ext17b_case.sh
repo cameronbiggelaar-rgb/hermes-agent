@@ -131,6 +131,12 @@ PY
       grep -q '"result"' /var/lib/hermes-release/restore-002/journal.json 2>/dev/null && break
       sleep 1
     done
+    # The terminal record is written before the supervisor finishes tearing down; wait for the
+    # engine itself to be gone so recovery does not refuse a still-exiting supervisor.
+    for _ in $(seq 1 120); do
+      pgrep -f 'release002_release\.sh --apply' >/dev/null 2>&1 || break
+      sleep 1
+    done
     # The supervisor has settled; recovery now binds to the durable journal alone.
     run recover "$Q" recover
     ;;
