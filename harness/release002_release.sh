@@ -767,6 +767,14 @@ on_exit() {
     rollback|done|recover|aborted) return 0 ;;
   esac
   [ "$rc" -ne 0 ] || return 0
+  # A terminal record for *this* run means the attempt is settled. Its non-zero exit is the outcome
+  # it recorded — ROLLED_BACK exits 1 by contract — not a failure to triage, and re-settling it here
+  # overwrites the result the release just proved (or, worse, files a contradictory NEEDS_HUMAN).
+  if [ -f "$JOURNAL" ] && env -u PYTHONPATH "$PY3" -c \
+      'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if d.get("result") and d.get("run_id")==sys.argv[2] else 1)' \
+      "$JOURNAL" "$RUN_ID" 2>/dev/null; then
+    return 0
+  fi
   # EXT-17A: the exit path obeys the same failure contract as abort_before_mutation. It never
   # restarts blind, never treats a late phase as "nothing happened", and never claims ABORTED_SAFE
   # for a phase the contract says needs a human.

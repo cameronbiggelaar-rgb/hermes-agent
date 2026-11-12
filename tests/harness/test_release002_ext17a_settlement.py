@@ -328,6 +328,15 @@ PYEOF
     freeze_release "rollback complete" || true
     echo "PHASE_AFTER=${PHASE}" >>"$STATE/log"
     dump 0 ;;
+  exit_ignores_a_settled_result)
+    PHASE=report
+    /usr/bin/python3.13 - "$JOURNAL" <<'PYEOF'
+import json, sys
+body = json.load(open(sys.argv[1]))
+body.update({"phase": "report", "result": "ROLLED_BACK"})
+json.dump(body, open(sys.argv[1], "w"))
+PYEOF
+    false; on_exit; rc=$?; dump "$rc" ;;
   exit_ignores_settled)
     ( PHASE=done; false; on_exit ); rc=$?; dump "$rc" ;;
   exit_ignores_non_apply)
@@ -552,6 +561,14 @@ def test_an_already_settled_attempt_is_not_re_settled(driver, tmp_path) -> None:
     r = run(driver, tmp_path, "exit_ignores_settled")
     assert r["journal"].get("result") != "ABORTED_SAFE"
     assert "ct journal" not in r["cmds"]
+
+
+def test_an_attempt_that_already_recorded_its_outcome_is_not_triaged_again(driver, tmp_path) -> None:
+    """The terminal record is the outcome; the non-zero exit that follows it is not a new failure."""
+    r = run(driver, tmp_path, "exit_ignores_a_settled_result")
+    assert r["journal"].get("result") == "ROLLED_BACK"
+    assert "ct journal" not in r["cmds"], r["cmds"]
+    assert not r["evidence"], r["evidence"]
 
 
 def test_a_non_apply_mode_never_settles(driver, tmp_path) -> None:
