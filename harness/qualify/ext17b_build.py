@@ -218,10 +218,13 @@ def build(args: argparse.Namespace) -> Path:
         "scenario": args.scenario,
         "stop_mode": args.stop_mode,
         "fail_start": bool(args.fail_start),
+        "fail_start_after": args.fail_start_after,
+        "fail_start_on": args.fail_start_on,
         "ack_drain": not args.no_ack,
         "stop_timeout_override": args.stop_timeout_override,
         "runtime_max_override": args.runtime_max_override,
         "candidate": args.candidate,
+        "active_agents": args.active_agents,
     }
     (root / "state" / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (root / "env.sh").write_text(env_lines(root, install, home), encoding="utf-8")
@@ -234,7 +237,15 @@ def build(args: argparse.Namespace) -> Path:
             "suppress_notification": True, "reason": "fixture foreign freeze",
         }, indent=2, sort_keys=True), encoding="utf-8")
     if args.dirty:
-        target = install / "harness" / "release002_control.py"
+        # Any tracked file will do: what the release must refuse is a *dirty installation*, i.e. a
+        # worktree that no longer matches the commit it claims to be. The release harness files are
+        # only added by `stage`, so dirt one of the files the clone always has.
+        target = next(
+            (path for path in (install / "AGENTS.md", install / "README.md") if path.exists()),
+            None,
+        )
+        if target is None:
+            raise SystemExit("fixture: no tracked file to dirty in the installation clone")
         target.write_text(target.read_text(encoding="utf-8") + "\n# fixture dirt\n", encoding="utf-8")
     if args.estop_foreign:
         (home / "ESTOP").write_text("foreign-attempt\n", encoding="utf-8")
@@ -265,10 +276,16 @@ if __name__ == "__main__":
     parser.add_argument("--scenario", default="clean")
     parser.add_argument("--stop-mode", default="clean", choices=["clean", "hang", "sigkill"])
     parser.add_argument("--fail-start", action="store_true")
+    # Fail only the restarts after the first N starts: the deployed unit cannot come up.
+    parser.add_argument("--fail-start-after", type=int, default=0)
+    # Fail exactly this start and no other, so a rollback restart can still succeed.
+    parser.add_argument("--fail-start-on", type=int, default=0)
     parser.add_argument("--no-ack", action="store_true")
     parser.add_argument("--stop-timeout-override", type=int, default=0)
     parser.add_argument("--runtime-max-override", type=int, default=0)
     parser.add_argument("--foreign-freeze", action="store_true")
     parser.add_argument("--estop-foreign", action="store_true")
     parser.add_argument("--dirty", action="store_true")
+    # A busy host never presents a quiet window: the release must abort before mutation.
+    parser.add_argument("--active-agents", type=int, default=0)
     print(build(parser.parse_args()))

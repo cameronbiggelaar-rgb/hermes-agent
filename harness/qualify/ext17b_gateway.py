@@ -91,7 +91,7 @@ def publish(state: str) -> None:
         "pid": os.getpid(),
         "code_sha": head_of(INSTALL),
         "updated_at": now_iso(),
-        "active_agents": 0,
+        "active_agents": int(cfg().get("active_agents", 0)),
         "open_sessions": sessions_open(),
         "exit_reason": None,
         "substitute": True,

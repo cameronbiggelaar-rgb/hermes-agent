@@ -228,8 +228,16 @@ def start_service() -> int:
     state = svc()
     if state.get("active") and alive(int(state.get("pid") or 0)):
         return 0
-    if cfg().get("fail_start"):
-        journal(f"{SERVICE}: Failed to start the Hermes Agent Gateway (scenario fail_start).")
+    # `fail_start` breaks every start; `fail_start_after` breaks only the starts after the first N,
+    # which is what a post-deployment restart failure looks like: the unit that was running stops
+    # fine and the regenerated one never comes up.
+    starts = int(state.get("starts") or 0)
+    state["starts"] = starts + 1
+    save(SVC_STATE, state)
+    after = int(cfg().get("fail_start_after") or 0)
+    on = int(cfg().get("fail_start_on") or 0)
+    if cfg().get("fail_start") or (after and starts >= after) or (on and state["starts"] == on):
+        journal(f"{SERVICE}: Failed to start the Hermes Agent Gateway (scenario start fault).")
         state.update({"active": False, "pid": 0, "failed": True})
         save(SVC_STATE, state)
         return 1
@@ -277,6 +285,17 @@ def cmd_systemctl(argv: list[str]) -> int:
         return 0
     if verb == "list-units":
         return 0
+    if verb in {"enable", "disable"}:
+        # `hermes gateway install --system` enables the unit; in the disposable unit directory the
+        # seed is already the unit under test, so enabling only records the state.
+        state = svc()
+        state["enabled"] = verb == "enable"
+        save(SVC_STATE, state)
+        journal(f"{SERVICE}: {verb}d (qualification)")
+        return 0
+    if verb == "is-enabled":
+        print("enabled" if svc().get("enabled", True) else "disabled")
+        return 0
     if verb == "is-active":
         props = properties()
         print(props["ActiveState"])
@@ -293,9 +312,16 @@ def cmd_systemctl(argv: list[str]) -> int:
     if verb == "show":
         wanted: list[str] = []
         value_only = False
+        pending = False
         for arg in argv[1:]:
-            if arg == "--value":
+            if pending:
+                wanted.extend(arg.split(","))
+                pending = False
+            elif arg == "--value":
                 value_only = True
+            elif arg == "-p":
+                # `systemctl show <unit> -p Name --value` is the form the release uses most.
+                pending = True
             elif arg.startswith("-p") and len(arg) > 2:
                 wanted.extend(arg[2:].split(","))
             elif arg.startswith("--property="):

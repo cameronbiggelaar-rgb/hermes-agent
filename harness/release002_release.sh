@@ -872,7 +872,11 @@ if [ "$MODE" = recover ]; then
         exit 2
       fi
       FROZEN=1; ESTOP_OURS=$(estop_is_ours && echo 1 || echo 0)
-      if ! verify_post_release "$PHASE" "$POST_UNIT_SHA"; then
+      # The phase must be one the preflight can evaluate. In recovery the deployment has already
+      # been restarted, so the state to prove is exactly the post-release one (freeze engaged, hold
+      # active, candidate deployed) — "recover" is not a preflight phase, and passing it made every
+      # recovery report an unevaluable NO_GO that no operator could ever clear.
+      if ! verify_post_release post "$POST_UNIT_SHA"; then
         needs_human "recovery verification NO_GO: $REASON (freeze left engaged)"
         journal aborted "recovery verification NO_GO: $REASON" 2>/dev/null || true
         exit 2
