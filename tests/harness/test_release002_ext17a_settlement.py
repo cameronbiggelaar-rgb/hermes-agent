@@ -323,6 +323,11 @@ body = json.load(open(sys.argv[1])); body["mutated"] = True
 json.dump(body, open(sys.argv[1], "w"))
 PYEOF
     ( false; on_exit ); rc=$?; dump "$rc" ;;
+  phase_after_freeze_release)
+    PHASE=rollback
+    freeze_release "rollback complete" || true
+    echo "PHASE_AFTER=${PHASE}" >>"$STATE/log"
+    dump 0 ;;
   exit_ignores_settled)
     ( PHASE=done; false; on_exit ); rc=$?; dump "$rc" ;;
   exit_ignores_non_apply)
@@ -529,6 +534,18 @@ def test_an_unhandled_post_mutation_exit_rolls_back(driver, tmp_path) -> None:
     assert r["journal"].get("result") == "ROLLED_BACK", "a late unhandled failure must roll back"
     assert "restart" in r["cmds"]
     assert r["journal"].get("result") != "ABORTED_SAFE"
+
+
+def test_releasing_the_freeze_restores_the_phase_the_attempt_is_in(driver, tmp_path) -> None:
+    """``unfreeze`` is work inside a phase, not a phase: leaving it set mislabels the exit.
+
+    A rollback exits non-zero by contract. While ``freeze_release`` left PHASE at ``unfreeze``, the
+    exit trap could not recognise the settled exit and wrote NEEDS_HUMAN evidence beside an already
+    written ROLLED_BACK receipt.
+    """
+    r = run(driver, tmp_path, "phase_after_freeze_release")
+    assert "PHASE_AFTER=rollback" in r["log"], r["log"]
+    assert "drain=absent" in r["stdout"], "the freeze must actually have been released"
 
 
 def test_an_already_settled_attempt_is_not_re_settled(driver, tmp_path) -> None:

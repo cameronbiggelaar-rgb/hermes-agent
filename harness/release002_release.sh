@@ -532,6 +532,11 @@ journal_require_attempt() { # refuse to change admission state without a durable
 
 freeze_release() { # freeze_release <why> -- 0 only when admission is provably restored by this attempt
   local why=${1:-release complete} deadline state="" cleared=1
+  # The phase this attempt is actually in, restored before every return: releasing the freeze is work
+  # done *inside* a phase, not a phase of its own. Leaving PHASE=unfreeze made the exit trap treat a
+  # verified rollback's contractual non-zero exit as an unhandled failure and page a human over a run
+  # that had already settled as ROLLED_BACK.
+  local phase_before=$PHASE
   PHASE=unfreeze
   rm -f "${ARCHIVE:-/dev/null}/.freeze-alive" 2>/dev/null || true
   if [ -n "$KEEPALIVE_PID" ]; then kill "$KEEPALIVE_PID" 2>/dev/null || true; KEEPALIVE_PID=""; fi
@@ -542,6 +547,7 @@ freeze_release() { # freeze_release <why> -- 0 only when admission is provably r
     # so the caller still knows which mechanism this attempt is holding.
     if [ -e "$DRAIN_MARKER" ] && ! drain_is_ours; then
       needs_human "the drain marker is no longer owned by $PRINCIPAL; leaving it in place"
+      PHASE=$phase_before
       return 1
     fi
     if [ -e "$DRAIN_MARKER" ]; then
@@ -560,6 +566,7 @@ PYEOF
   if [ "$ESTOP_OURS" -eq 1 ]; then
     if [ -e "$ESTOP_FILE" ] && ! estop_is_ours; then
       needs_human "the ESTOP sentinel is no longer owned by $PRINCIPAL; leaving it in place"
+      PHASE=$phase_before
       return 1
     fi
     if [ -e "$ESTOP_FILE" ]; then
@@ -587,11 +594,13 @@ PYEOF
     ESTOP_OURS=0
     log "admission restored ($why): gateway_state=${state:-unreadable} estop=absent"
     journal unfreeze "admission restored: $why" 2>/dev/null || true
+    PHASE=$phase_before
     return 0
   fi
   log "admission NOT restored ($why): gateway_state=${state:-unreadable} drain_marker=$([ -e "$DRAIN_MARKER" ] && echo present || echo absent) estop=$([ -e "$ESTOP_FILE" ] && echo present || echo absent)"
   needs_human "admission could not be restored ($why): ${SETTLE_FAILURES:-state unverifiable}; freeze left engaged"
   journal aborted "freeze release unverified: $why" 2>/dev/null || true
+  PHASE=$phase_before
   return 1
 }
 
