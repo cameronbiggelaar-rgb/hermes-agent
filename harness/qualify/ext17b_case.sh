@@ -122,7 +122,16 @@ PY
     else
       say signal-term 2
     fi
-    wait
+    wait || true
+    # Recovery while that supervisor is still running must be refused: acting on a half-finished
+    # attempt races the settlement that is about to happen, and can claim a completion the
+    # supervisor then rolls back.
+    run recover-while-running "$Q" recover
+    for _ in $(seq 1 600); do
+      grep -q '"result"' /var/lib/hermes-release/restore-002/journal.json 2>/dev/null && break
+      sleep 1
+    done
+    # The supervisor has settled; recovery now binds to the durable journal alone.
     run recover "$Q" recover
     ;;
 

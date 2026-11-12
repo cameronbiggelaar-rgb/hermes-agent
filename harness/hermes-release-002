@@ -485,8 +485,36 @@ PYEOF
   return "$rc"
 }
 
+guard_no_live_supervisor() { # recover must never race a release that is still running
+  # Recovery reads the journal and then acts on it. Acting while the supervisor that owns the
+  # journal is still inside a restart means acting on a half-finished attempt: recovery decided
+  # "candidate deployed and service active" *during* a 300 s stop, claimed the verification complete
+  # and restored admission, and the supervisor then rolled the deployment back over the top of it.
+  local others self_start st unit active p
+  others=$(pgrep -f 'release002_release\.sh --apply' | grep -v -e "^$$" -e "^$PPID$" || true)
+  if [ -n "$others" ]; then
+    # pgrep forks a subshell that inherits this argv and matches its own pattern; a match is only a
+    # foreign engine when the process is older than this launcher, which no forked helper can be.
+    self_start=$(sed -e 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+    others=$(printf '%s\n' $others | while read -r p; do
+      case "$p" in "$$"|"$PPID") continue ;; esac
+      st=$(sed -e 's/.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $20}')
+      [ -n "$st" ] || continue
+      [ "$st" -lt "$self_start" ] && printf '%s\n' "$p"
+    done || true)
+  fi
+  [ -z "$others" ] || die "recovery refused: a release engine is still running (pids: $others); wait for it to finish"
+  for unit in $(systemctl list-units --all --plain --no-legend 'hermes-release-*.service' 2>/dev/null | awk '{print $1}'); do
+    active=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || echo unknown)
+    case "$active" in
+      active|activating|deactivating|reloading)
+        die "recovery refused: supervisor $unit is still $active; wait for it to finish" ;;
+    esac
+  done
+}
+
 cmd_recover() {
-  require_root; prepare_engine
+  require_root; prepare_engine; guard_no_live_supervisor
   log "recovering with journal $JOURNAL"
   "$ENGINE_DIR/harness/release002_release.sh" --recover --candidate "$CANDIDATE"
 }
