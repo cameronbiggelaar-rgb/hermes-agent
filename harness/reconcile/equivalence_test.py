@@ -6,7 +6,10 @@ Lane A: the sanctioned runtime path, executed in-process on a disposable copy â€
         ``hermes_state_runtime.resolve_unknown_session_input`` with the same
         ``_terminal_write=close_discarded_turn(..., notice=None)`` closure that
         ``SessionAuthority.resolve_unknown_as_owner`` passes for an operator discard.
-Lane B: ``adm_recon.py --apply`` on a second, identical copy.
+Lane B: ``adm_recon.py --apply`` on a second, identical copy â€” one invocation per admission,
+        in roster order, each naming its identity explicitly (no implicit multi-row APPLY).
+Mixed:  ``--mixed`` runs the runtime's own path for the first admission and the operator tool
+        for the remaining ones on the same copy, then requires the identical final image.
 
 Both copies start from the same source file. Afterwards every touched row image, every
 table row count and the schema fingerprint must agree, and Lane B must show exactly six
@@ -44,7 +47,29 @@ INTEGRITY_TABLES = ("session_admissions", "sessions", "worker_executions", "stat
 results = []
 
 
-def check(name, cond, detail=""):
+RUNTIME_OPEN_MIGRATION_KEYS = {
+    # One-time open-time bookkeeping the runtime performs on the store itself. It is not part of
+    # the admission transition: a plain SessionDB open with no discard at all produces the same
+    # delta, and the live WAL store (where the pass can only defer against concurrent writers)
+    # still carries the pre-migration keys. See probe_state_meta.py in the receipts directory.
+    "legacy_refusal_repair_pending",
+    "legacy_refusal_repair_session_cursor",
+    "legacy_refusal_repair_scanned",
+    "legacy_refusal_repair",
+    "message_uid_backfill",
+    "message_uid_backfill_id",
+}
+
+
+def state_meta_image(path):
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return dict(conn.execute("SELECT key, value FROM state_meta"))
+    finally:
+        conn.close()
+
+
+def check(name, cond, detail: object = ""):
     results.append((name, bool(cond), detail))
     print(f"{'PASS' if cond else 'FAIL'} {name}{(' :: ' + str(detail)[:400]) if detail and not cond else ''}")
 
@@ -117,7 +142,7 @@ def instrument(db, extra_exclude=()):
     conn.close()
 
 
-def lane_a(db_path):
+def lane_a(db_path, targets=None):
     """The runtime's own fenced resolution, exactly as SessionAuthority runs it."""
     sys.path.insert(0, "/home/hermes/.hermes/hermes-agent")
     os.environ.setdefault("HERMES_HOME", "/home/hermes/.hermes")
@@ -129,7 +154,7 @@ def lane_a(db_path):
 
     db = SessionDB(Path(db_path).resolve())
     epoch = None
-    for aid, _sid in TARGETS:
+    for aid, _sid in (targets or TARGETS):
         if epoch is None:
             with db._read_ctx() as conn:
                 epoch = conn.execute("SELECT epoch FROM runtime_epoch WHERE singleton=1").fetchone()[0]
@@ -152,6 +177,8 @@ def main():
                     help="path handed to --backup/--backup-sha256 (default: the source file)")
     ap.add_argument("--sequential", action="store_true",
                     help="do not keep both 13GB copies at once: run B, snapshot, delete, run A")
+    ap.add_argument("--mixed", action="store_true",
+                    help="Lane A for the first admission, Lane B for the rest, on one copy")
     ap.add_argument("--allow-runtime-migrations", action="store_true",
                     help="partial fixtures only: SessionDB's open runs schema migrations that a real "
                          "store already has, so B legitimately gains objects")
@@ -183,21 +210,48 @@ def main():
 
     pristine_sha = sha(pristine)
     print(f"pristine={pristine} sha256={pristine_sha}")
+    p0 = state_meta_image(pristine)
 
-    # ---- Lane B: the operator tool -------------------------------------------------
+    # ---- Lane B: the operator tool, one explicitly selected admission per invocation ----
     shutil.copy2(args.source, a)
+    if args.mixed:
+        # The CA-required order: the runtime resolves the first identity, the operator tool is
+        # then used for the second and third, on the same store.
+        lane_a(a, TARGETS[:1])
+        check("mixed/laneA-first-terminal",
+              ro(a).execute("SELECT status FROM session_admissions WHERE admission_id=?",
+                            (TARGETS[0][0],)).fetchone()[0] == "terminal", TARGETS[0][0])
+        seq = TARGETS[1:]
+    else:
+        seq = TARGETS
     instrument(a)
-    proc = subprocess.run([PY, TOOL, "--db", a, "--trigger-script", TRIGGER,
-                           "--out", os.path.join(args.workdir, "out-B"), "--apply",
-                           "--ignore-table", "_adm_audit", "--backup", pristine,
-                           "--backup-sha256", pristine_sha],
-                          capture_output=True, text=True)
-    check("laneB/exit0", proc.returncode == 0, proc.stdout[-600:] + proc.stderr[-600:])
+    epoch_a = ro(a).execute("SELECT epoch FROM runtime_epoch WHERE singleton=1").fetchone()[0]
+    for idx, (aid, _sid) in enumerate(seq, 1):
+        out = os.path.join(args.workdir, f"out-B{idx}")
+        before_n = len(ro(a).execute("SELECT * FROM _adm_audit").fetchall())
+        proc = subprocess.run([PY, TOOL, "--db", a, "--trigger-script", TRIGGER,
+                               "--out", out, "--apply", "--admission", aid,
+                               "--expect-epoch", str(epoch_a),
+                               "--ignore-table", "_adm_audit", "--backup", pristine,
+                               "--backup-sha256", pristine_sha],
+                              capture_output=True, text=True)
+        check(f"laneB/{aid[:8]}/exit0", proc.returncode == 0,
+              proc.stdout[-600:] + proc.stderr[-600:])
+        ev = os.path.join(out, "evidence.json")
+        payload = json.load(open(ev, encoding="utf-8")) if os.path.exists(ev) else {}
+        check(f"laneB/{aid[:8]}/disposition-verified",
+              payload.get("disposition") == "committed_verified", payload.get("problems"))
+        rows = [dict(r) for r in ro(a).execute("SELECT tbl, key FROM _adm_audit ORDER BY rowid")]
+        new = rows[before_n:]
+        check(f"laneB/{aid[:8]}/writes-are-exactly-its-own",
+              sorted(w["tbl"] for w in new) == ["session_admissions", "sessions"]
+              and {w["key"] for w in new} <= {aid, _sid}, new)
     writes = [dict(r) for r in ro(a).execute("SELECT tbl, key FROM _adm_audit ORDER BY tbl, key")]
-    check("laneB/writes==6", len(writes) == 6, writes)
-    check("laneB/writes-are-3+3",
-          sorted((w["tbl"] for w in writes)) == ["session_admissions"] * 3 + ["sessions"] * 3, writes)
+    check("laneB/writes==2*applies", len(writes) == 2 * len(seq), writes)
+    check("laneB/no-implicit-multi-row-apply",
+          not [w for w in writes if len(writes) != 2 * len(seq)], writes)
     ia = row_images(a)
+    sm_a = state_meta_image(a)  # captured before --sequential deletes copy A
     integ_a = {t: ro(a).execute(f"PRAGMA integrity_check('{t}')").fetchone()[0] for t in INTEGRITY_TABLES}
 
     # ---- Lane A: the runtime's own path -------------------------------------------
@@ -229,7 +283,8 @@ def main():
     # row counts: only the audit table may differ (it lives on A only)
     ra = dict(ia["rowcounts"]); rb = dict(ib["rowcounts"])
     ra.pop("_adm_audit", None); rb.pop("_adm_audit", None)
-    check("equiv/schema-unchanged-by-tool", ia["schema"] == base["schema"], "tool altered sqlite_master")
+    check("equiv/schema-unchanged-by-tool", ia["schema"] == (ib if args.mixed else base)["schema"],
+          "tool altered sqlite_master")
     if args.allow_runtime_migrations:
         extra = sorted(set(rb) - set(ra))
         # migrations also seed state_meta keys on a store that never ran them
@@ -242,8 +297,28 @@ def main():
     else:
         check("equiv/schema-unchanged-by-runtime", ib["schema"] == base["schema"],
               "runtime open altered sqlite_master (migrations) - disclose")
-        check("equiv/rowcounts", ra == rb,
-              {k: (ra.get(k), rb.get(k)) for k in set(ra) | set(rb) if ra.get(k) != rb.get(k)})
+        strict = {k: (ra.get(k), rb.get(k)) for k in set(ra) | set(rb)
+                  if k != "state_meta" and ra.get(k) != rb.get(k)}
+        check("equiv/rowcounts", not strict, strict)
+        # state_meta is compared by content, not by count: the runtime's open runs two one-time
+        # bookkeeping passes (legacy safety-refusal repair, message-uid backfill) that touch only
+        # their own marker keys. Everything else must be byte-identical.
+        sm_b = state_meta_image(b)
+        d_a = {k: (p0.get(k), sm_a.get(k)) for k in set(p0) | set(sm_a) if p0.get(k) != sm_a.get(k)}
+        d_b = {k: (p0.get(k), sm_b.get(k)) for k in set(p0) | set(sm_b) if p0.get(k) != sm_b.get(k)}
+        print(f"state_meta rows: pristine={len(p0)} tool={len(sm_a)} runtime={len(sm_b)}")
+        print(f"state_meta tool delta:    {sorted(d_a)}")
+        print(f"state_meta runtime delta: {sorted(d_b)}")
+        check("equiv/state-meta-runtime-open-only", set(d_b) <= RUNTIME_OPEN_MIGRATION_KEYS,
+              sorted(set(d_b) - RUNTIME_OPEN_MIGRATION_KEYS))
+        if args.mixed:
+            # Lane A ran on this copy first, so the open-time bookkeeping may show here too.
+            check("equiv/state-meta-tool-untouched", set(d_a) <= RUNTIME_OPEN_MIGRATION_KEYS,
+                  sorted(set(d_a) - RUNTIME_OPEN_MIGRATION_KEYS))
+        else:
+            check("equiv/state-meta-tool-untouched", not d_a, sorted(d_a))
+        meta_writes = [w for w in writes if w["tbl"] == "state_meta"]
+        check("equiv/state-meta-tool-writes", not meta_writes, meta_writes)
 
     # both lanes must leave the store in the state the trigger reads as quiet
     # A live snapshot carries other, unrelated non-terminal admissions (in-flight work on other
